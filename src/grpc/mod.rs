@@ -29,5 +29,4 @@ pub mod shared {
 
 // Convenience re-exports
 pub use shared::proto::services::v1 as services;
-pub use shared::proto::core::v1 as core_types;
-pub use client::ConstructClient;
+pub use shared::proto::core::v1 as core_types;pub use client::ConstructClient;

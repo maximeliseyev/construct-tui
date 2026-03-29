@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Layout},
     style::{Color, Style},
@@ -7,16 +7,27 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
+use tokio::sync::mpsc;
 
 use crate::{
+    config::load_config,
     event::{is_quit, Event, EventHandler},
     screens::{ChatListPane, ChatViewPane, OnboardingScreen},
+    screens::onboarding::OnboardingField,
     tui::Tui,
 };
 
 #[derive(Debug, Clone, PartialEq)]
 enum Screen {
+    /// Checking for saved session on startup.
+    Startup,
+    /// Onboarding form (first run or after logout).
     Onboarding,
+    /// Auth request in flight — show spinner message.
+    Connecting(String),
+    /// Auth failed — show error, return to onboarding.
+    AuthError(String),
+    /// Authenticated — show main chat UI.
     Main,
 }
 
@@ -27,6 +38,13 @@ enum Focus {
     Compose,
 }
 
+/// Messages sent from the background auth task back to the UI event loop.
+#[derive(Debug)]
+enum AuthMsg {
+    Success { user_id: String },
+    Failure(String),
+}
+
 pub struct App {
     screen: Screen,
     onboarding: OnboardingScreen,
@@ -35,6 +53,8 @@ pub struct App {
     chat_view: ChatViewPane,
     status: String,
     running: bool,
+    auth_rx: Option<mpsc::Receiver<AuthMsg>>,
+    server_url: String,
 }
 
 impl App {
@@ -44,68 +64,154 @@ impl App {
             .selected_contact()
             .map(|c| c.display_name.clone())
             .unwrap_or_default();
+
+        let server_url = load_config()
+            .map(|c| c.server)
+            .unwrap_or_else(|_| "https://ams.konstruct.cc:443".into());
+
         Self {
-            screen: Screen::Onboarding,
+            screen: Screen::Startup,
             onboarding: OnboardingScreen::new(),
             focus: Focus::ContactList,
             chat_list,
             chat_view: ChatViewPane::new(initial_name),
             status: "Ready".into(),
             running: true,
+            auth_rx: None,
+            server_url,
         }
     }
 
     pub async fn run(&mut self, terminal: &mut Tui) -> Result<()> {
+        // On startup: try to restore saved session
+        self.start_auth_restore();
+
         let mut events = EventHandler::new();
         while self.running {
+            // Poll for auth task completion
+            self.poll_auth();
+
             terminal.draw(|frame| self.render(frame))?;
-            if let Some(event) = events.next().await {
-                self.handle_event(event);
+
+            // Short timeout so we can repaint while auth is running
+            tokio::select! {
+                Some(event) = events.next() => self.handle_event(event),
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {}
             }
         }
         Ok(())
     }
+
+    // ── Auth task management ────────────────────────────────────────────────────
+
+    fn start_auth_restore(&mut self) {
+        let (tx, rx) = mpsc::channel(1);
+        self.auth_rx = Some(rx);
+        let url = self.server_url.clone();
+        tokio::spawn(async move {
+            let msg = match crate::auth::try_restore_session(&url).await {
+                Ok(Some(r)) => AuthMsg::Success { user_id: r.user_id },
+                Ok(None) => AuthMsg::Failure("no_session".into()),
+                Err(e) => AuthMsg::Failure(e.to_string()),
+            };
+            let _ = tx.send(msg).await;
+        });
+        self.screen = Screen::Connecting("Restoring session…".into());
+    }
+
+    fn start_auth_register(&mut self, username: String) {
+        let (tx, rx) = mpsc::channel(1);
+        self.auth_rx = Some(rx);
+        let url = self.server_url.clone();
+        let name = if username.is_empty() { None } else { Some(username) };
+        tokio::spawn(async move {
+            let msg = match crate::auth::register_new_device(&url, name.as_deref()).await {
+                Ok(r) => AuthMsg::Success { user_id: r.user_id },
+                Err(e) => AuthMsg::Failure(e.to_string()),
+            };
+            let _ = tx.send(msg).await;
+        });
+        self.screen = Screen::Connecting("Solving proof-of-work, registering device…".into());
+    }
+
+    fn poll_auth(&mut self) {
+        let Some(rx) = self.auth_rx.as_mut() else { return };
+        match rx.try_recv() {
+            Ok(AuthMsg::Success { user_id }) => {
+                self.auth_rx = None;
+                self.status = format!("Connected as {}", user_id);
+                self.screen = Screen::Main;
+            }
+            Ok(AuthMsg::Failure(msg)) if msg == "no_session" => {
+                // No saved session → show onboarding
+                self.auth_rx = None;
+                self.screen = Screen::Onboarding;
+            }
+            Ok(AuthMsg::Failure(msg)) => {
+                self.auth_rx = None;
+                match self.screen {
+                    Screen::Connecting(_) if self.onboarding.username.is_empty() => {
+                        // Startup restore failed → show onboarding (not an error to display)
+                        self.screen = Screen::Onboarding;
+                    }
+                    _ => {
+                        self.screen = Screen::AuthError(msg);
+                    }
+                }
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {} // still running
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                self.auth_rx = None;
+            }
+        }
+    }
+
+    // ── Event handling ──────────────────────────────────────────────────────────
 
     fn handle_event(&mut self, event: Event) {
         let Event::Key(key) = event;
         if key.kind != KeyEventKind::Press {
             return;
         }
-        match self.screen {
+        match &self.screen.clone() {
+            Screen::Startup | Screen::Connecting(_) => {
+                // Ctrl+C always exits
+                if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+                    self.running = false;
+                }
+            }
+            Screen::AuthError(_) => {
+                // Any key dismisses the error and returns to onboarding
+                self.screen = Screen::Onboarding;
+            }
             Screen::Onboarding => self.handle_onboarding(key),
             Screen::Main => self.handle_main(key),
         }
     }
 
-    // ── Onboarding ──────────────────────────────────────────────────────────────
-
     fn handle_onboarding(&mut self, key: crossterm::event::KeyEvent) {
-        use crate::screens::onboarding::OnboardingField;
         match key.code {
-            // Allow 'q' to quit only when the username field is empty (nothing typed yet)
             KeyCode::Char('q')
-                if key.modifiers == crossterm::event::KeyModifiers::NONE
+                if key.modifiers == KeyModifiers::NONE
                     && self.onboarding.focused_field == OnboardingField::Username
                     && self.onboarding.username.is_empty() =>
             {
                 self.running = false;
             }
-            KeyCode::Char('c') if key.modifiers == crossterm::event::KeyModifiers::CONTROL => {
+            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
                 self.running = false;
             }
             KeyCode::Tab | KeyCode::BackTab => {
                 self.onboarding.next_field();
             }
             KeyCode::Enter => {
-                let (user, pass) = self.onboarding.credentials();
-                if user.is_empty() || pass.is_empty() {
-                    self.onboarding.status = Some("Username and password are required".into());
+                let username = self.onboarding.username.trim().to_string();
+                if username.is_empty() {
+                    self.onboarding.status = Some("Enter a username to continue".into());
                     self.onboarding.is_error = true;
                 } else {
-                    // TODO: call construct-core auth
-                    self.onboarding.status = Some(format!("Connecting as {}…", user));
-                    self.onboarding.is_error = false;
-                    self.screen = Screen::Main;
+                    self.onboarding.status = None;
+                    self.start_auth_register(username);
                 }
             }
             KeyCode::Backspace => {
@@ -119,8 +225,6 @@ impl App {
             _ => {}
         }
     }
-
-    // ── Main chat UI ────────────────────────────────────────────────────────────
 
     fn handle_main(&mut self, key: crossterm::event::KeyEvent) {
         if is_quit(&key) && self.focus != Focus::Compose {
@@ -158,7 +262,7 @@ impl App {
                             text,
                             time: current_time_hhmm(),
                         });
-                        self.status = "Message queued (no backend yet)".into();
+                        self.status = "Message queued".into();
                     }
                 }
                 KeyCode::Backspace => self.chat_view.pop_char(),
@@ -178,10 +282,50 @@ impl App {
     // ── Rendering ───────────────────────────────────────────────────────────────
 
     fn render(&mut self, frame: &mut Frame) {
-        match self.screen {
-            Screen::Onboarding => frame.render_widget(&self.onboarding, frame.area()),
+        match &self.screen.clone() {
+            Screen::Onboarding | Screen::AuthError(_) => {
+                frame.render_widget(&self.onboarding, frame.area());
+                // Overlay error if present
+                if let Screen::AuthError(msg) = &self.screen {
+                    self.render_error_overlay(frame, msg.clone());
+                }
+            }
+            Screen::Startup => {
+                frame.render_widget(&self.onboarding, frame.area());
+                self.render_spinner(frame, "Restoring session…".into());
+            }
+            Screen::Connecting(msg) => {
+                let msg = msg.clone();
+                frame.render_widget(&self.onboarding, frame.area());
+                self.render_spinner(frame, msg);
+            }
             Screen::Main => self.render_main(frame),
         }
+    }
+
+    fn render_spinner(&self, frame: &mut Frame, msg: String) {
+        let area = frame.area();
+        let y = area.height.saturating_sub(2);
+        let line = Line::from(vec![
+            Span::styled("  ⠋ ", Style::default().fg(Color::Cyan)),
+            Span::styled(msg, Style::default().fg(Color::White)),
+        ]);
+        frame.render_widget(Paragraph::new(line), ratatui::layout::Rect {
+            x: 0, y, width: area.width, height: 1,
+        });
+    }
+
+    fn render_error_overlay(&self, frame: &mut Frame, msg: String) {
+        let area = frame.area();
+        let y = area.height.saturating_sub(2);
+        let display = format!("  ✗ {}  (any key to retry)", msg);
+        let line = Line::from(Span::styled(
+            display.clone(),
+            Style::default().fg(Color::Red),
+        ));
+        frame.render_widget(Paragraph::new(line), ratatui::layout::Rect {
+            x: 0, y, width: area.width, height: 1,
+        });
     }
 
     fn render_main(&mut self, frame: &mut Frame) {
@@ -232,7 +376,5 @@ fn current_time_hhmm() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let h = (secs % 86400) / 3600;
-    let m = (secs % 3600) / 60;
-    format!("{:02}:{:02}", h, m)
+    format!("{:02}:{:02}", (secs % 86400) / 3600, (secs % 3600) / 60)
 }
