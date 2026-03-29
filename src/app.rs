@@ -10,9 +10,15 @@ use ratatui::{
 
 use crate::{
     event::{is_quit, Event, EventHandler},
-    screens::{ChatListPane, ChatViewPane},
+    screens::{ChatListPane, ChatViewPane, OnboardingScreen},
     tui::Tui,
 };
+
+#[derive(Debug, Clone, PartialEq)]
+enum Screen {
+    Onboarding,
+    Main,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 enum Focus {
@@ -22,6 +28,8 @@ enum Focus {
 }
 
 pub struct App {
+    screen: Screen,
+    onboarding: OnboardingScreen,
     focus: Focus,
     chat_list: ChatListPane,
     chat_view: ChatViewPane,
@@ -37,6 +45,8 @@ impl App {
             .map(|c| c.display_name.clone())
             .unwrap_or_default();
         Self {
+            screen: Screen::Onboarding,
+            onboarding: OnboardingScreen::new(),
             focus: Focus::ContactList,
             chat_list,
             chat_view: ChatViewPane::new(initial_name),
@@ -47,10 +57,8 @@ impl App {
 
     pub async fn run(&mut self, terminal: &mut Tui) -> Result<()> {
         let mut events = EventHandler::new();
-
         while self.running {
             terminal.draw(|frame| self.render(frame))?;
-
             if let Some(event) = events.next().await {
                 self.handle_event(event);
             }
@@ -63,12 +71,62 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
+        match self.screen {
+            Screen::Onboarding => self.handle_onboarding(key),
+            Screen::Main => self.handle_main(key),
+        }
+    }
 
+    // ── Onboarding ──────────────────────────────────────────────────────────────
+
+    fn handle_onboarding(&mut self, key: crossterm::event::KeyEvent) {
+        use crate::screens::onboarding::OnboardingField;
+        match key.code {
+            // Allow 'q' to quit only when the username field is empty (nothing typed yet)
+            KeyCode::Char('q')
+                if key.modifiers == crossterm::event::KeyModifiers::NONE
+                    && self.onboarding.focused_field == OnboardingField::Username
+                    && self.onboarding.username.is_empty() =>
+            {
+                self.running = false;
+            }
+            KeyCode::Char('c') if key.modifiers == crossterm::event::KeyModifiers::CONTROL => {
+                self.running = false;
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.onboarding.next_field();
+            }
+            KeyCode::Enter => {
+                let (user, pass) = self.onboarding.credentials();
+                if user.is_empty() || pass.is_empty() {
+                    self.onboarding.status = Some("Username and password are required".into());
+                    self.onboarding.is_error = true;
+                } else {
+                    // TODO: call construct-core auth
+                    self.onboarding.status = Some(format!("Connecting as {}…", user));
+                    self.onboarding.is_error = false;
+                    self.screen = Screen::Main;
+                }
+            }
+            KeyCode::Backspace => {
+                self.onboarding.pop_char();
+                self.onboarding.status = None;
+            }
+            KeyCode::Char(c) => {
+                self.onboarding.push_char(c);
+                self.onboarding.status = None;
+            }
+            _ => {}
+        }
+    }
+
+    // ── Main chat UI ────────────────────────────────────────────────────────────
+
+    fn handle_main(&mut self, key: crossterm::event::KeyEvent) {
         if is_quit(&key) && self.focus != Focus::Compose {
             self.running = false;
             return;
         }
-
         match self.focus {
             Focus::ContactList => match key.code {
                 KeyCode::Down | KeyCode::Char('j') => self.chat_list.next(),
@@ -82,14 +140,12 @@ impl App {
                 }
                 _ => {}
             },
-
             Focus::ChatView => match key.code {
                 KeyCode::Tab | KeyCode::Char('i') => self.set_focus(Focus::Compose),
                 KeyCode::BackTab => self.set_focus(Focus::ContactList),
                 KeyCode::Esc => self.set_focus(Focus::ContactList),
                 _ => {}
             },
-
             Focus::Compose => match key.code {
                 KeyCode::Esc => self.set_focus(Focus::ChatView),
                 KeyCode::Enter => {
@@ -105,12 +161,8 @@ impl App {
                         self.status = "Message queued (no backend yet)".into();
                     }
                 }
-                KeyCode::Backspace => {
-                    self.chat_view.pop_char();
-                }
-                KeyCode::Char(c) => {
-                    self.chat_view.push_char(c);
-                }
+                KeyCode::Backspace => self.chat_view.pop_char(),
+                KeyCode::Char(c) => self.chat_view.push_char(c),
                 _ => {}
             },
         }
@@ -123,10 +175,17 @@ impl App {
         self.focus = f;
     }
 
-    fn render(&mut self, frame: &mut Frame) {
-        let area = frame.area();
+    // ── Rendering ───────────────────────────────────────────────────────────────
 
-        // Root layout: title bar / body / status bar
+    fn render(&mut self, frame: &mut Frame) {
+        match self.screen {
+            Screen::Onboarding => frame.render_widget(&self.onboarding, frame.area()),
+            Screen::Main => self.render_main(frame),
+        }
+    }
+
+    fn render_main(&mut self, frame: &mut Frame) {
+        let area = frame.area();
         let root = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
@@ -134,7 +193,6 @@ impl App {
         ])
         .split(area);
 
-        // Title bar
         let title = Paragraph::new(Line::from(vec![
             Span::styled(" ◆ Construct ", Style::default().fg(Color::Cyan)),
             Span::styled("TUI", Style::default().fg(Color::White)),
@@ -146,14 +204,11 @@ impl App {
         ]));
         frame.render_widget(title, root[0]);
 
-        // Body: contacts (25%) | chat (75%)
         let body = Layout::horizontal([Constraint::Percentage(25), Constraint::Percentage(75)])
             .split(root[1]);
-
         frame.render_widget(&mut self.chat_list, body[0]);
         frame.render_widget(&mut self.chat_view, body[1]);
 
-        // Status bar
         let status = Paragraph::new(Line::from(vec![
             Span::styled(" ● ", Style::default().fg(Color::Green)),
             Span::raw(&self.status),
@@ -163,14 +218,16 @@ impl App {
 }
 
 fn uuid_placeholder() -> String {
-    format!("msg-{}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis())
+    format!(
+        "msg-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    )
 }
 
 fn current_time_hhmm() -> String {
-    // Simple UTC time display — replace with local time when chrono is added
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
