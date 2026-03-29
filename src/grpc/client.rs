@@ -7,8 +7,10 @@ use tonic::{
 
 use crate::grpc::services::{
     auth_service_client::AuthServiceClient,
+    device_link_service_client::DeviceLinkServiceClient,
     AuthenticateDeviceRequest,
     AuthTokensResponse,
+    ConfirmDeviceLinkRequest,
     DevicePublicKeys,
     GetPowChallengeRequest,
     PowSolution as ProtoPowSolution,
@@ -18,6 +20,7 @@ use crate::grpc::services::{
 /// Construct server gRPC client wrapper.
 pub struct ConstructClient {
     auth: AuthServiceClient<Channel>,
+    link: DeviceLinkServiceClient<Channel>,
 }
 
 impl ConstructClient {
@@ -32,8 +35,31 @@ impl ConstructClient {
             .context("gRPC connect failed")?;
 
         Ok(Self {
-            auth: AuthServiceClient::new(channel),
+            auth: AuthServiceClient::new(channel.clone()),
+            link: DeviceLinkServiceClient::new(channel),
         })
+    }
+
+    /// Link this device to an existing account using a token from the primary device.
+    /// The token is the `link_token` from `InitiateDeviceLinkResponse` (shown as QR on phone).
+    pub async fn confirm_device_link(
+        &mut self,
+        link_token: &str,
+        device_id: &str,
+        public_keys: DevicePublicKeys,
+    ) -> Result<AuthTokensResponse> {
+        let req = ConfirmDeviceLinkRequest {
+            link_token: link_token.to_string(),
+            device_id: device_id.to_string(),
+            public_keys: Some(public_keys),
+        };
+        let resp = self
+            .link
+            .confirm_device_link(Request::new(req))
+            .await
+            .context("confirm_device_link RPC failed")?
+            .into_inner();
+        Ok(resp)
     }
 
     /// Authenticate an existing device.

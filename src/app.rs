@@ -1,19 +1,19 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
+    Frame,
     layout::{Constraint, Layout},
     style::{Color, Style},
     text::{Line, Span},
     widgets::Paragraph,
-    Frame,
 };
 use tokio::sync::mpsc;
 
 use crate::{
     config::load_config,
-    event::{is_quit, Event, EventHandler},
-    screens::{ChatListPane, ChatViewPane, OnboardingScreen},
+    event::{Event, EventHandler, is_quit},
     screens::onboarding::OnboardingField,
+    screens::{ChatListPane, ChatViewPane, OnboardingScreen},
     tui::Tui,
 };
 
@@ -123,7 +123,11 @@ impl App {
         let (tx, rx) = mpsc::channel(1);
         self.auth_rx = Some(rx);
         let url = self.server_url.clone();
-        let name = if username.is_empty() { None } else { Some(username) };
+        let name = if username.is_empty() {
+            None
+        } else {
+            Some(username)
+        };
         tokio::spawn(async move {
             let msg = match crate::auth::register_new_device(&url, name.as_deref()).await {
                 Ok(r) => AuthMsg::Success { user_id: r.user_id },
@@ -135,7 +139,9 @@ impl App {
     }
 
     fn poll_auth(&mut self) {
-        let Some(rx) = self.auth_rx.as_mut() else { return };
+        let Some(rx) = self.auth_rx.as_mut() else {
+            return;
+        };
         match rx.try_recv() {
             Ok(AuthMsg::Success { user_id }) => {
                 self.auth_rx = None;
@@ -310,9 +316,15 @@ impl App {
             Span::styled("  ⠋ ", Style::default().fg(Color::Cyan)),
             Span::styled(msg, Style::default().fg(Color::White)),
         ]);
-        frame.render_widget(Paragraph::new(line), ratatui::layout::Rect {
-            x: 0, y, width: area.width, height: 1,
-        });
+        frame.render_widget(
+            Paragraph::new(line),
+            ratatui::layout::Rect {
+                x: 0,
+                y,
+                width: area.width,
+                height: 1,
+            },
+        );
     }
 
     fn render_error_overlay(&self, frame: &mut Frame, msg: String) {
@@ -323,9 +335,15 @@ impl App {
             display.clone(),
             Style::default().fg(Color::Red),
         ));
-        frame.render_widget(Paragraph::new(line), ratatui::layout::Rect {
-            x: 0, y, width: area.width, height: 1,
-        });
+        frame.render_widget(
+            Paragraph::new(line),
+            ratatui::layout::Rect {
+                x: 0,
+                y,
+                width: area.width,
+                height: 1,
+            },
+        );
     }
 
     fn render_main(&mut self, frame: &mut Frame) {
