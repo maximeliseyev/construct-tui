@@ -1,5 +1,6 @@
 //! gRPC channel factory — creates a `tonic::transport::Channel` based on the
 //! configured transport mode (`Direct`, `Obfs4`, `Obfs4Tls`, `CdnFront`).
+#![allow(dead_code)]
 
 use anyhow::{Context, Result};
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};

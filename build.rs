@@ -14,9 +14,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tonic_build::configure()
         .build_server(false)
-        // Suppress clippy warnings in generated protobuf code (large enums, naming, docs).
+        // Suppress clippy/rustc warnings in generated protobuf code.
         .emit_rerun_if_changed(false)
-        .type_attribute(".", "#[allow(clippy::large_enum_variant, clippy::enum_variant_names, clippy::doc_lazy_continuation)]")
+        .type_attribute(".", "#[allow(clippy::large_enum_variant, clippy::enum_variant_names, clippy::doc_lazy_continuation, dead_code)]")
         .compile_protos(&protos.map(|p| proto_dir.join(p)), &includes)?;
 
     // Re-run if any proto changes

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use anyhow::{Context, Result};
 use ed25519_dalek::{Signer, SigningKey};
 use tonic::{
@@ -238,10 +239,7 @@ impl KeyUserClient {
     /// Fetch the pre-key bundle for `user_id` and serialize it to the
     /// JSON format expected by `Orchestrator::init_session_with_bundle`.
     pub async fn get_pre_key_bundle_json(&mut self, user_id: &str) -> Result<String> {
-        use crate::grpc::services::{
-            GetPreKeyBundleRequest, key_service_client::KeyServiceClient,
-        };
-        use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+        use crate::grpc::services::{GetPreKeyBundleRequest, key_service_client::KeyServiceClient};
 
         let mut key_svc = KeyServiceClient::new(self.channel.clone());
         let resp = key_svc
@@ -283,10 +281,7 @@ impl KeyUserClient {
         };
         let pre_keys = keys
             .into_iter()
-            .map(|(key_id, public_key)| OneTimePreKey {
-                key_id,
-                public_key: public_key.into(),
-            })
+            .map(|(key_id, public_key)| OneTimePreKey { key_id, public_key })
             .collect();
 
         let mut key_svc = KeyServiceClient::new(self.channel.clone());
@@ -306,9 +301,7 @@ impl KeyUserClient {
 
     /// Find a user by their username and return the user_id.
     pub async fn find_user(&mut self, username: &str) -> Result<Option<String>> {
-        use crate::grpc::services::{
-            FindUserRequest, user_service_client::UserServiceClient,
-        };
+        use crate::grpc::services::{FindUserRequest, user_service_client::UserServiceClient};
         use tonic::Code;
 
         let mut user_svc = UserServiceClient::new(self.channel.clone());

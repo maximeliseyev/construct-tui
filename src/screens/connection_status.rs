@@ -12,6 +12,7 @@ use ratatui::{
 
 /// Live connection state — updated by the streaming worker via InternalEvent.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub enum ConnectionState {
     /// Not yet connected (startup).
     #[default]

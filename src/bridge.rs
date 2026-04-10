@@ -3,6 +3,7 @@
 //! `TuiBridge` wires the Rust crypto core to:
 //! - SQLite (`Storage`) for message + key persistence
 //! - gRPC stream (`StreamCmd` sender) for outbound envelopes
+#![allow(dead_code)]
 //! - A UI event channel for notifying the app of new messages
 //!
 //! The bridge is the **only** place that should call `Storage` or push to the

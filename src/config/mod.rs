@@ -5,8 +5,10 @@ use aes_gcm::{
 use anyhow::{Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+use hkdf::Hkdf;
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::path::PathBuf;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -34,6 +36,24 @@ pub struct Session {
     /// Ed25519 signature over the SPK public key (hex, 64 bytes). Required by ClassicClient::from_keys().
     #[serde(default)]
     pub spk_sig_hex: String,
+}
+
+/// Per-session derived key material. Both fields are zeroized on drop.
+/// Held in memory for the full authenticated session lifetime — never serialized to disk.
+pub struct DerivedKeys {
+    /// AES-256-GCM key for encrypting `session.enc`.
+    pub session: Zeroizing<[u8; 32]>,
+    /// AES-256 key fed to SQLCipher for `messages.db` page encryption.
+    pub database: Zeroizing<[u8; 32]>,
+}
+
+/// Bundles derived keys with the Argon2id master salt.
+/// The salt is constant for the lifetime of an identity — it must never change while
+/// the database is open, because the DB key is derived from it.
+pub struct SessionKey {
+    pub keys: DerivedKeys,
+    /// 16-byte Argon2id salt, stored in `session.enc` and reused on every re-save.
+    pub master_salt: [u8; 16],
 }
 
 /// App-level config.
@@ -115,11 +135,11 @@ pub fn detect_session() -> SessionState {
     }
 }
 
-// ── Encryption helpers ─────────────────────────────────────────────────────────
+// ── Key derivation ─────────────────────────────────────────────────────────────
 
-/// Derive a 32-byte AES key from passphrase via Argon2id.
-/// Parameters tuned for Raspberry Pi: 32 MB memory, 3 iterations, 1 thread.
-fn derive_key(passphrase: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+/// Argon2id: passphrase + salt → 32-byte master key.
+/// Parameters tuned for Raspberry Pi 4 (32 MB memory, 3 iterations, 1 thread).
+fn derive_master_key(passphrase: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
     let params =
         Params::new(32_768, 3, 1, Some(32)).map_err(|e| anyhow::anyhow!("Argon2 params: {e}"))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
@@ -130,16 +150,77 @@ fn derive_key(passphrase: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
     Ok(key)
 }
 
-/// Save session encrypted with Argon2id + AES-256-GCM.
-/// Uses a fresh random salt and nonce on every save.
-pub fn save_session_encrypted(session: &Session, passphrase: &[u8]) -> Result<()> {
-    let mut salt = [0u8; 16];
+/// HKDF-SHA-256: master key → two domain-separated 32-byte keys.
+/// Using distinct info strings gives independent keys even from the same master.
+fn derive_keys_from_master(master: &[u8; 32]) -> Result<DerivedKeys> {
+    let hkdf = Hkdf::<Sha256>::new(None, master.as_ref());
+    let mut session_key = Zeroizing::new([0u8; 32]);
+    let mut db_key = Zeroizing::new([0u8; 32]);
+    hkdf.expand(b"construct-session-v1", session_key.as_mut())
+        .map_err(|_| anyhow::anyhow!("HKDF expand (session) failed"))?;
+    hkdf.expand(b"construct-database-v1", db_key.as_mut())
+        .map_err(|_| anyhow::anyhow!("HKDF expand (database) failed"))?;
+    Ok(DerivedKeys {
+        session: session_key,
+        database: db_key,
+    })
+}
+
+/// Derive a `SessionKey` for an **existing** session on disk.
+///
+/// Reads the master salt from `session.enc` (no decryption), runs Argon2id,
+/// then splits with HKDF into session-encryption and database-encryption keys.
+/// Returns `None` if no session file exists.
+pub fn open_session_key(passphrase: &[u8]) -> Result<Option<SessionKey>> {
+    let Some(master_salt) = read_master_salt()? else {
+        return Ok(None);
+    };
+    let master = derive_master_key(passphrase, &master_salt)?;
+    let keys = derive_keys_from_master(&master)?;
+    Ok(Some(SessionKey { keys, master_salt }))
+}
+
+/// Create a **fresh** `SessionKey` for a brand-new account.
+/// Generates a random 16-byte master salt and derives all keys from it.
+pub fn create_session_key(passphrase: &[u8]) -> Result<SessionKey> {
+    let mut master_salt = [0u8; 16];
+    OsRng.fill_bytes(&mut master_salt);
+    let master = derive_master_key(passphrase, &master_salt)?;
+    let keys = derive_keys_from_master(&master)?;
+    Ok(SessionKey { keys, master_salt })
+}
+
+/// Read the Argon2id master salt from `session.enc` without decrypting the session.
+/// Used to derive keys before decryption.
+pub fn read_master_salt() -> Result<Option<[u8; 16]>> {
+    let path = session_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = std::fs::read_to_string(&path)?;
+    let enc: EncryptedSession =
+        serde_json::from_str(&data).context("session file is not in encrypted format")?;
+    let salt = B64.decode(&enc.salt).context("bad salt encoding")?;
+    if salt.len() != 16 {
+        return Err(anyhow::anyhow!(
+            "unexpected salt length: {} (expected 16)",
+            salt.len()
+        ));
+    }
+    let mut arr = [0u8; 16];
+    arr.copy_from_slice(&salt);
+    Ok(Some(arr))
+}
+
+// ── Encryption helpers ─────────────────────────────────────────────────────────
+
+/// Save session encrypted with the provided `SessionKey`.
+/// Uses the `master_salt` from `sk` (constant per identity) and a fresh AES-GCM nonce.
+pub fn save_session_encrypted(session: &Session, sk: &SessionKey) -> Result<()> {
     let mut nonce_bytes = [0u8; 12];
-    OsRng.fill_bytes(&mut salt);
     OsRng.fill_bytes(&mut nonce_bytes);
 
-    let key = derive_key(passphrase, &salt)?;
-    let cipher = Aes256Gcm::new_from_slice(key.as_ref())
+    let cipher = Aes256Gcm::new_from_slice(sk.keys.session.as_ref())
         .map_err(|_| anyhow::anyhow!("AES-GCM init failed"))?;
 
     let mut plaintext = serde_json::to_vec(session)?;
@@ -151,7 +232,7 @@ pub fn save_session_encrypted(session: &Session, passphrase: &[u8]) -> Result<()
 
     let enc = EncryptedSession {
         v: 1,
-        salt: B64.encode(salt),
+        salt: B64.encode(sk.master_salt),
         nonce: B64.encode(nonce_bytes),
         ciphertext: B64.encode(ciphertext),
     };
@@ -166,10 +247,10 @@ pub fn save_session_encrypted(session: &Session, passphrase: &[u8]) -> Result<()
     Ok(())
 }
 
-/// Decrypt and load session from disk.
+/// Decrypt and load the session using the provided `SessionKey`.
 /// Returns `None` if the session file doesn't exist.
-/// Returns `Err` if the file exists but decryption fails (wrong passphrase or corruption).
-pub fn load_session_encrypted(passphrase: &[u8]) -> Result<Option<Session>> {
+/// Returns `Err` if the file is present but decryption fails (wrong key or corruption).
+pub fn load_session_encrypted(sk: &SessionKey) -> Result<Option<Session>> {
     let path = session_path()?;
     if !path.exists() {
         return Ok(None);
@@ -178,14 +259,12 @@ pub fn load_session_encrypted(passphrase: &[u8]) -> Result<Option<Session>> {
     let enc: EncryptedSession =
         serde_json::from_str(&data).context("session file is not in encrypted format")?;
 
-    let salt = B64.decode(&enc.salt).context("bad salt encoding")?;
     let nonce_bytes = B64.decode(&enc.nonce).context("bad nonce encoding")?;
     let ciphertext = B64
         .decode(&enc.ciphertext)
         .context("bad ciphertext encoding")?;
 
-    let key = derive_key(passphrase, &salt)?;
-    let cipher = Aes256Gcm::new_from_slice(key.as_ref())
+    let cipher = Aes256Gcm::new_from_slice(sk.keys.session.as_ref())
         .map_err(|_| anyhow::anyhow!("AES-GCM init failed"))?;
 
     let nonce = Nonce::from_slice(&nonce_bytes);
@@ -225,7 +304,15 @@ pub fn config_path() -> Result<PathBuf> {
 }
 
 pub fn session_path() -> Result<PathBuf> {
-    Ok(config_dir()?.join("session.json"))
+    let dir = config_dir()?;
+    let enc_path = dir.join("session.enc");
+    let old_path = dir.join("session.json");
+    // Transparent migration: rename on first access so both plaintext and encrypted
+    // sessions land in session.enc going forward.
+    if old_path.exists() && !enc_path.exists() {
+        std::fs::rename(&old_path, &enc_path)?;
+    }
+    Ok(enc_path)
 }
 
 // ── Persistence ────────────────────────────────────────────────────────────────
@@ -239,6 +326,7 @@ pub fn load_config() -> Result<Config> {
     Ok(serde_json::from_str(&data)?)
 }
 
+#[allow(dead_code)]
 pub fn save_config(cfg: &Config) -> Result<()> {
     let path = config_path()?;
     std::fs::write(path, serde_json::to_string_pretty(cfg)?)?;

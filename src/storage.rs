@@ -26,6 +26,7 @@ pub struct StoredMessage {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct StoredContact {
     pub user_id: String,
     pub display_name: String,
@@ -42,8 +43,29 @@ pub struct Storage {
 }
 
 impl Storage {
-    /// Open (or create) the storage database at `~/.local/share/construct-tui/messages.db`.
-    pub fn open() -> Result<Self> {
+    /// Open (or create) the storage database encrypted with SQLCipher.
+    ///
+    /// `db_key` is the 32-byte AES-256 database key derived from the user's passphrase
+    /// via Argon2id + HKDF (`config::SessionKey::keys.database`).
+    pub fn open(db_key: &[u8]) -> Result<Self> {
+        anyhow::ensure!(db_key.len() == 32, "db_key must be 32 bytes");
+        let path = db_path()?;
+        let conn =
+            Connection::open(&path).with_context(|| format!("open db at {}", path.display()))?;
+        // SQLCipher key must be set before any schema access.
+        let key_hex = hex::encode(db_key);
+        conn.execute_batch(&format!(
+            "PRAGMA key = \"x'{key_hex}'\";\nPRAGMA cipher_page_size = 4096;\n"
+        ))
+        .context("SQLCipher key/cipher_page_size pragma")?;
+        let storage = Self { conn };
+        storage.init()?;
+        Ok(storage)
+    }
+
+    /// Open an unencrypted database (`--no-encrypt` mode only).
+    /// All plaintext data is protected solely by filesystem permissions (`0o600`).
+    pub fn open_unencrypted() -> Result<Self> {
         let path = db_path()?;
         let conn =
             Connection::open(&path).with_context(|| format!("open db at {}", path.display()))?;
@@ -171,6 +193,7 @@ impl Storage {
 
     // ── Contacts ──────────────────────────────────────────────────────────────
 
+    #[allow(dead_code)]
     pub fn upsert_contact(&self, contact: &StoredContact) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO contacts (user_id, display_name, identity_key_b64)
@@ -184,6 +207,7 @@ impl Storage {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn get_contacts(&self) -> Result<Vec<StoredContact>> {
         let mut stmt = self.conn.prepare(
             "SELECT user_id, display_name, identity_key_b64 FROM contacts ORDER BY display_name",
@@ -209,6 +233,7 @@ impl Storage {
     }
 
     /// Drain all pending ACKs, clearing the table.
+    #[allow(dead_code)]
     pub fn pop_all_acks(&self) -> Result<Vec<(String, i64)>> {
         let mut stmt = self
             .conn
@@ -285,7 +310,16 @@ fn db_path() -> Result<PathBuf> {
     let base = dirs::data_local_dir().context("cannot locate data dir")?;
     let dir = base.join("construct-tui");
     std::fs::create_dir_all(&dir)?;
-    Ok(dir.join("messages.db"))
+    let path = dir.join("messages.db");
+    // Restrict permissions to owner read/write only on Unix.
+    #[cfg(unix)]
+    if !path.exists() {
+        // Create the file first so we can set permissions before SQLite writes to it.
+        let _ = std::fs::File::create(&path);
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(path)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

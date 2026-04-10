@@ -665,6 +665,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "hex",
+ "hkdf",
  "prost",
  "rand",
  "ratatui",

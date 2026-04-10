@@ -22,6 +22,7 @@ use crate::grpc::shared::proto::services::v1::{
 
 /// Commands sent **to** the stream worker from the app.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum StreamCmd {
     /// Send an envelope to a recipient.
     Send(Box<Envelope>),

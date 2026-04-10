@@ -17,10 +17,12 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use anyhow::Result;
-use construct_core::orchestration::{actions::{Action, IncomingEvent}, orchestrator::Orchestrator};
+use construct_core::orchestration::{
+    actions::{Action, IncomingEvent},
+    orchestrator::Orchestrator,
+};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
@@ -54,6 +56,7 @@ impl OrchestratorHandle {
 /// * `internal_tx` — channel back to the UI app event loop (BridgeEvent)
 /// * `grpc_url` / `access_token` — for FetchPublicKeyBundle and key upload
 /// * `my_user_id` / `my_device_id` — local identity for Envelope construction
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_orchestrator_task(
     orchestrator: Orchestrator,
     storage: Storage,
@@ -85,6 +88,7 @@ pub fn spawn_orchestrator_task(
 
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     mut orchestrator: Orchestrator,
     mut storage: Storage,
@@ -238,7 +242,7 @@ async fn dispatch(
         }
 
         Action::HealSuppressed {
-            contact_id,
+            contact_id: _,
             retry_after_ms,
         } => {
             // Retry after the cooldown expires.
@@ -279,9 +283,7 @@ async fn dispatch(
         }
 
         Action::CheckAckInDb { message_id } => {
-            let is_processed = storage
-                .has_ack(&message_id)
-                .unwrap_or(false);
+            let is_processed = storage.has_ack(&message_id).unwrap_or(false);
             follow_ups.push(IncomingEvent::AckDbResult {
                 message_id,
                 is_processed,
@@ -457,7 +459,14 @@ fn build_control_envelope(
     payload: Vec<u8>,
     message_id: String,
 ) -> Envelope {
-    build_envelope(from_user, from_device, to_user, payload, message_id, content_type)
+    build_envelope(
+        from_user,
+        from_device,
+        to_user,
+        payload,
+        message_id,
+        content_type,
+    )
 }
 
 fn content_type_from_u8(v: u8) -> ContentType {

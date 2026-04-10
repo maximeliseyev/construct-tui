@@ -9,11 +9,10 @@ use ratatui::{
 };
 use tokio::sync::mpsc;
 use uuid::Uuid;
-use zeroize::Zeroizing;
 
 use crate::{
     bridge::{BridgeEvent, TokenRefreshMsg},
-    config::{self, Session, SessionState, TransportConfig},
+    config::{self, Session, SessionKey, SessionState, TransportConfig},
     event::{Event, EventHandler, is_quit},
     screens::onboarding::OnboardingField,
     screens::{
@@ -59,18 +58,21 @@ enum Focus {
 
 /// Messages sent from background auth tasks back to the UI event loop.
 #[derive(Debug)]
-enum AuthMsg {
+pub(crate) enum AuthMsg {
     /// Authentication succeeded.
-    Success {
-        user_id: String,
-        device_id: String,
-        access_token: String,
-        /// Full session including private keys — used to construct the Orchestrator.
-        full_session: config::Session,
-        /// When `Some`, this session must be persisted to disk (new/updated).
-        pending_save: Option<config::Session>,
-    },
+    Success(Box<AuthSuccess>),
     Failure(String),
+}
+
+#[derive(Debug)]
+pub(crate) struct AuthSuccess {
+    user_id: String,
+    device_id: String,
+    access_token: String,
+    /// Full session including private keys — used to construct the Orchestrator.
+    full_session: config::Session,
+    /// When `Some`, this session must be persisted to disk (new/updated).
+    pending_save: Option<config::Session>,
 }
 
 /// Unified internal event type — all background tasks funnel through this.
@@ -89,6 +91,7 @@ pub struct AppConfig {
     pub server_url: String,
     pub transport: TransportConfig,
     pub no_encrypt: bool,
+    #[allow(dead_code)]
     pub headless: bool,
     pub pq_active: bool,
 }
@@ -98,8 +101,12 @@ pub struct App {
     onboarding: OnboardingScreen,
     device_link: DeviceLinkScreen,
     unlock_screen: UnlockScreen,
-    /// Passphrase kept in memory (zeroized on drop) for re-encrypting on token refresh.
-    session_passphrase: Option<Zeroizing<Vec<u8>>>,
+    /// Derived key material for the active session (zeroized on drop / logout).
+    /// `None` in `--no-encrypt` mode or before the user has entered their passphrase.
+    session_key: Option<SessionKey>,
+    /// The fully decrypted session currently in memory — used for token refresh
+    /// re-saves without requiring a disk re-read.
+    current_session: Option<Session>,
     /// New session awaiting passphrase before being saved.
     pending_session: Option<Session>,
     /// When true: skip encryption (headless / --no-encrypt mode).
@@ -157,7 +164,8 @@ impl App {
             onboarding: OnboardingScreen::new(),
             device_link: DeviceLinkScreen::new(),
             unlock_screen: UnlockScreen::new(UnlockMode::Unlock),
-            session_passphrase: None,
+            session_key: None,
+            current_session: None,
             pending_session: None,
             no_encrypt: cfg.no_encrypt,
             focus: Focus::ContactList,
@@ -224,14 +232,16 @@ impl App {
         tokio::spawn(async move {
             let msg = match crate::auth::try_restore_session(&url).await {
                 Ok(Some(r)) => {
-                    let full = r.session.expect("try_restore_session always returns session");
-                    AuthMsg::Success {
+                    let full = r
+                        .session
+                        .expect("try_restore_session always returns session");
+                    AuthMsg::Success(Box::new(AuthSuccess {
                         user_id: r.user_id,
                         device_id: r.device_id,
                         access_token: r.access_token,
                         full_session: full.clone(),
                         pending_save: None, // already saved inside try_restore_session
-                    }
+                    }))
                 }
                 Ok(None) => AuthMsg::Failure("no_session".into()),
                 Err(e) => AuthMsg::Failure(e.to_string()),
@@ -248,14 +258,17 @@ impl App {
         tokio::spawn(async move {
             let msg = match crate::auth::authenticate_saved_session(session, &url).await {
                 Ok(r) => {
-                    let full = r.session.clone().expect("authenticate_saved_session always returns session");
-                    AuthMsg::Success {
+                    let full = r
+                        .session
+                        .clone()
+                        .expect("authenticate_saved_session always returns session");
+                    AuthMsg::Success(Box::new(AuthSuccess {
                         user_id: r.user_id,
                         device_id: r.device_id,
                         access_token: r.access_token,
                         full_session: full.clone(),
                         pending_save: r.session,
-                    }
+                    }))
                 }
                 Err(e) => AuthMsg::Failure(e.to_string()),
             };
@@ -275,14 +288,17 @@ impl App {
         tokio::spawn(async move {
             let msg = match crate::auth::register_new_device(&url, name.as_deref()).await {
                 Ok(r) => {
-                    let full = r.session.clone().expect("register_new_device always returns session");
-                    AuthMsg::Success {
+                    let full = r
+                        .session
+                        .clone()
+                        .expect("register_new_device always returns session");
+                    AuthMsg::Success(Box::new(AuthSuccess {
                         user_id: r.user_id,
                         device_id: r.device_id,
                         access_token: r.access_token,
                         full_session: full.clone(),
                         pending_save: r.session,
-                    }
+                    }))
                 }
                 Err(e) => AuthMsg::Failure(e.to_string()),
             };
@@ -297,14 +313,17 @@ impl App {
         tokio::spawn(async move {
             let msg = match crate::auth::link_existing_device(&url, &token).await {
                 Ok(r) => {
-                    let full = r.session.clone().expect("link_existing_device always returns session");
-                    AuthMsg::Success {
+                    let full = r
+                        .session
+                        .clone()
+                        .expect("link_existing_device always returns session");
+                    AuthMsg::Success(Box::new(AuthSuccess {
                         user_id: r.user_id,
                         device_id: r.device_id,
                         access_token: r.access_token,
                         full_session: full.clone(),
                         pending_save: r.session,
-                    }
+                    }))
                 }
                 Err(e) => AuthMsg::Failure(e.to_string()),
             };
@@ -324,13 +343,14 @@ impl App {
 
     fn handle_auth_msg(&mut self, msg: AuthMsg) {
         match msg {
-            AuthMsg::Success {
-                user_id,
-                device_id,
-                access_token,
-                full_session,
-                pending_save,
-            } => {
+            AuthMsg::Success(s) => {
+                let AuthSuccess {
+                    user_id,
+                    device_id,
+                    access_token,
+                    full_session,
+                    pending_save,
+                } = *s;
                 self.status = format!("Connected as {}", user_id);
                 self.user_id = user_id.clone();
                 self.device_id = device_id.clone();
@@ -346,29 +366,49 @@ impl App {
                     &user_id,
                     self.pq_active,
                 );
-
-                // Start the E2EE Orchestrator in the background.
-                self.start_orchestrator(full_session.clone(), user_id.clone(), device_id.clone(), access_token.clone());
+                // Keep the decrypted session in memory for token-refresh re-saves.
+                self.current_session = Some(full_session.clone());
 
                 if let Some(session) = pending_save {
                     self.start_token_refresh(&session);
 
-                    if let Some(ref passphrase) = self.session_passphrase {
-                        match config::save_session_encrypted(&session, passphrase) {
-                            Ok(()) => self.screen = Screen::Main,
+                    if let Some(ref sk) = self.session_key {
+                        // Keys are already derived (unlock path or link/register with existing keys).
+                        match config::save_session_encrypted(&session, sk) {
+                            Ok(()) => {
+                                self.start_orchestrator(
+                                    full_session,
+                                    user_id,
+                                    device_id,
+                                    access_token,
+                                );
+                                self.screen = Screen::Main;
+                            }
                             Err(e) => self.screen = Screen::AuthError(format!("Save failed: {e}")),
                         }
                     } else if self.no_encrypt {
                         match config::save_session(&session) {
-                            Ok(()) => self.screen = Screen::Main,
+                            Ok(()) => {
+                                self.start_orchestrator(
+                                    full_session,
+                                    user_id,
+                                    device_id,
+                                    access_token,
+                                );
+                                self.screen = Screen::Main;
+                            }
                             Err(e) => self.screen = Screen::AuthError(format!("Save failed: {e}")),
                         }
                     } else {
+                        // New registration — no passphrase yet.
+                        // Wait for SetPassphrase before opening the encrypted database.
                         self.pending_session = Some(session);
                         self.unlock_screen.reset_for_mode(UnlockMode::SetNew);
                         self.screen = Screen::SetPassphrase;
                     }
                 } else {
+                    // Session was already saved (restore-from-disk path) — start right away.
+                    self.start_orchestrator(full_session, user_id, device_id, access_token);
                     self.screen = Screen::Main;
                 }
             }
@@ -395,30 +435,42 @@ impl App {
         device_id: String,
         access_token: String,
     ) {
+        use crate::orchestrator_task::spawn_orchestrator_task;
+        use crate::storage::Storage;
+        use crate::streaming::{StreamEvent, spawn_stream_worker};
         use construct_core::{
             crypto::{client_api::ClassicClient, suites::classic::ClassicSuiteProvider},
             orchestration::orchestrator::Orchestrator,
         };
-        use crate::orchestrator_task::spawn_orchestrator_task;
-        use crate::streaming::{spawn_stream_worker, StreamCmd, StreamEvent};
-        use crate::storage::Storage;
 
         // Decode private keys from hex.
         let identity_secret = match hex::decode(&session.identity_key_hex) {
             Ok(v) => v,
-            Err(e) => { self.status = format!("Orchestrator key decode error: {e}"); return; }
+            Err(e) => {
+                self.status = format!("Orchestrator key decode error: {e}");
+                return;
+            }
         };
         let signing_secret = match hex::decode(&session.signing_key_hex) {
             Ok(v) => v,
-            Err(e) => { self.status = format!("Orchestrator key decode error: {e}"); return; }
+            Err(e) => {
+                self.status = format!("Orchestrator key decode error: {e}");
+                return;
+            }
         };
         let spk_secret = match hex::decode(&session.spk_key_hex) {
             Ok(v) => v,
-            Err(e) => { self.status = format!("Orchestrator key decode error: {e}"); return; }
+            Err(e) => {
+                self.status = format!("Orchestrator key decode error: {e}");
+                return;
+            }
         };
         let spk_sig = match hex::decode(&session.spk_sig_hex) {
             Ok(v) => v,
-            Err(e) => { self.status = format!("Orchestrator key decode error: {e}"); return; }
+            Err(e) => {
+                self.status = format!("Orchestrator key decode error: {e}");
+                return;
+            }
         };
 
         // Construct the ClassicClient.
@@ -429,22 +481,35 @@ impl App {
             spk_sig,
         ) {
             Ok(c) => c,
-            Err(e) => { self.status = format!("Orchestrator init error: {e}"); return; }
+            Err(e) => {
+                self.status = format!("Orchestrator init error: {e}");
+                return;
+            }
         };
 
         let orchestrator = Orchestrator::new(client, user_id.clone());
 
-        let storage = match Storage::open() {
-            Ok(s) => s,
-            Err(e) => { self.status = format!("Storage open error: {e}"); return; }
+        let storage = if let Some(ref sk) = self.session_key {
+            match Storage::open(sk.keys.database.as_ref()) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.status = format!("Storage open error: {e}");
+                    return;
+                }
+            }
+        } else {
+            match Storage::open_unencrypted() {
+                Ok(s) => s,
+                Err(e) => {
+                    self.status = format!("Storage open error: {e}");
+                    return;
+                }
+            }
         };
 
         // Spawn the gRPC stream worker.
-        let (stream_tx, mut stream_rx) = spawn_stream_worker(
-            self.server_url.clone(),
-            access_token.clone(),
-            vec![],
-        );
+        let (stream_tx, mut stream_rx) =
+            spawn_stream_worker(self.server_url.clone(), access_token.clone(), vec![]);
         self.stream_tx = Some(stream_tx.clone());
 
         // Spawn the Orchestrator actor task.
@@ -471,13 +536,18 @@ impl App {
                 match event {
                     StreamEvent::Message(envelope) => {
                         // Unpack the wire payload to extract header fields.
-                        if let Ok(decoded) = construct_core::wire_payload::unpack(&envelope.encrypted_payload) {
-                            let from = envelope.sender
+                        if let Ok(decoded) =
+                            construct_core::wire_payload::unpack(&envelope.encrypted_payload)
+                        {
+                            let from = envelope
+                                .sender
                                 .as_ref()
                                 .map(|s| s.user_id.clone())
                                 .unwrap_or_default();
                             let message_id = match &envelope.message_id_type {
-                                Some(crate::grpc::core_types::envelope::MessageIdType::MessageId(id)) => id.clone(),
+                                Some(
+                                    crate::grpc::core_types::envelope::MessageIdType::MessageId(id),
+                                ) => id.clone(),
                                 _ => String::new(),
                             };
                             let content_type = envelope.content_type as u8;
@@ -584,40 +654,29 @@ impl App {
         }
     }
 
-    /// Build an updated Session from refreshed tokens (if we have a current session in memory).
-    /// Returns None if we cannot reconstruct the session (e.g. no saved passphrase to re-load).
+    /// Build an updated Session with refreshed tokens, using the in-memory session copy.
     fn build_updated_session(
         &self,
         access_token: String,
         refresh_token: String,
         expires_at: i64,
     ) -> Option<Session> {
-        // Try to load the current session from disk and patch the tokens.
-        if let Some(ref passphrase) = self.session_passphrase
-            && let Ok(Some(mut session)) = config::load_session_encrypted(passphrase)
-        {
-            session.access_token = access_token;
-            session.refresh_token = refresh_token;
-            session.expires_at = expires_at;
-            return Some(session);
-        }
-        if self.no_encrypt
-            && let Ok(Some(mut session)) = config::load_session()
-        {
-            session.access_token = access_token;
-            session.refresh_token = refresh_token;
-            session.expires_at = expires_at;
-            return Some(session);
-        }
-        None
+        let mut session = self.current_session.clone()?;
+        session.access_token = access_token;
+        session.refresh_token = refresh_token;
+        session.expires_at = expires_at;
+        Some(session)
     }
 
     fn persist_session_background(&mut self, session: Session) {
+        // Keep in-memory copy fresh so token refreshes don't need disk reads.
+        self.current_session = Some(session.clone());
+
         // Restart token refresh with new expiry.
         self.start_token_refresh(&session);
 
-        if let Some(ref passphrase) = self.session_passphrase {
-            let _ = config::save_session_encrypted(&session, passphrase);
+        if let Some(ref sk) = self.session_key {
+            let _ = config::save_session_encrypted(&session, sk);
         } else if self.no_encrypt {
             let _ = config::save_session(&session);
         }
@@ -727,11 +786,17 @@ impl App {
                     self.unlock_screen.set_error("Enter your passphrase");
                     return;
                 }
-                match config::load_session_encrypted(&passphrase) {
-                    Ok(Some(session)) => {
-                        self.session_passphrase = Some(passphrase);
-                        self.start_auth_restore_preloaded(session);
-                    }
+                match config::open_session_key(&passphrase) {
+                    Ok(Some(sk)) => match config::load_session_encrypted(&sk) {
+                        Ok(Some(session)) => {
+                            self.session_key = Some(sk);
+                            self.start_auth_restore_preloaded(session);
+                        }
+                        Ok(None) => self.unlock_screen.set_error("No session found"),
+                        Err(e) => self
+                            .unlock_screen
+                            .set_error(format!("Session corrupted: {e}")),
+                    },
                     Ok(None) => self.unlock_screen.set_error("No session found"),
                     Err(_) => self
                         .unlock_screen
@@ -754,14 +819,30 @@ impl App {
                     return;
                 }
                 if let Some(session) = self.pending_session.take() {
-                    match config::save_session_encrypted(&session, &passphrase) {
-                        Ok(()) => {
-                            self.session_passphrase = Some(passphrase);
-                            self.screen = Screen::Main;
-                        }
+                    match config::create_session_key(&passphrase) {
+                        Ok(sk) => match config::save_session_encrypted(&session, &sk) {
+                            Ok(()) => {
+                                self.session_key = Some(sk);
+                                // Orchestrator was deferred until now — we finally have the DB key.
+                                if let Some(full) = self.current_session.clone() {
+                                    self.start_orchestrator(
+                                        full,
+                                        self.user_id.clone(),
+                                        self.device_id.clone(),
+                                        self.access_token.clone(),
+                                    );
+                                }
+                                self.screen = Screen::Main;
+                            }
+                            Err(e) => {
+                                self.pending_session = Some(session);
+                                self.unlock_screen.set_error(format!("Save failed: {e}"));
+                            }
+                        },
                         Err(e) => {
                             self.pending_session = Some(session);
-                            self.unlock_screen.set_error(format!("Save failed: {e}"));
+                            self.unlock_screen
+                                .set_error(format!("Key derivation failed: {e}"));
                         }
                     }
                 }
@@ -846,6 +927,7 @@ impl App {
                         let message_id = generate_message_id();
 
                         // Send via E2EE Orchestrator if wired up.
+                        #[allow(clippy::collapsible_if)]
                         if let Some(ref orch) = self.orch_handle {
                             if let Some(contact) = self.chat_list.selected_contact() {
                                 orch.send(construct_core::orchestration::actions::IncomingEvent::OutgoingMessage {
@@ -986,7 +1068,8 @@ impl App {
         if let Some(ref tx) = self.stream_tx.take() {
             let _ = tx.try_send(crate::streaming::StreamCmd::Shutdown);
         }
-        self.session_passphrase = None;
+        self.session_key = None;
+        self.current_session = None;
         self.pending_session = None;
         self.user_id = String::new();
         self.device_id = String::new();
