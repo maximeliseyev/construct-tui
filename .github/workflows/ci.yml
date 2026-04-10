@@ -1,0 +1,198 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "dev"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── 1. Lint + Test ─────────────────────────────────────────────────────────
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + components)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: linux-x64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-x64-cargo-
+
+      - name: Install system deps (OpenSSL, pkg-config)
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
+      - name: cargo fmt check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all
+
+  # ── 2. Build — Linux x86_64 ────────────────────────────────────────────────
+  build-linux-x64:
+    name: Build Linux x86_64
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: linux-x64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-x64-cargo-
+
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: construct-tui-linux-x86_64
+          path: target/release/construct-tui
+          retention-days: 7
+
+  # ── 3. Build — Linux aarch64 (RPi 4 / ARM servers) ─────────────────────────
+  build-linux-aarch64:
+    name: Build Linux aarch64
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: linux-aarch64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-aarch64-cargo-
+
+      - name: Install cross-compilation toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu pkg-config libssl-dev
+
+      - name: Build release (cross)
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          PKG_CONFIG_ALLOW_CROSS: "1"
+          OPENSSL_STATIC: "1"
+        run: cargo build --release --target aarch64-unknown-linux-gnu
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: construct-tui-linux-aarch64
+          path: target/aarch64-unknown-linux-gnu/release/construct-tui
+          retention-days: 7
+
+  # ── 4. Build — macOS (Apple Silicon) ──────────────────────────────────────
+  build-macos-arm64:
+    name: Build macOS arm64
+    runs-on: macos-14
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: macos-arm64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: macos-arm64-cargo-
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: construct-tui-macos-arm64
+          path: target/release/construct-tui
+          retention-days: 7
+
+  # ── 5. GitHub Release (on tag push) ───────────────────────────────────────
+  release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: [build-linux-x64, build-linux-aarch64, build-macos-arm64]
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: construct-tui-linux-x86_64
+          path: dist/linux-x86_64/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: construct-tui-linux-aarch64
+          path: dist/linux-aarch64/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: construct-tui-macos-arm64
+          path: dist/macos-arm64/
+
+      - name: Package archives
+        run: |
+          chmod +x dist/linux-x86_64/construct-tui
+          chmod +x dist/linux-aarch64/construct-tui
+          chmod +x dist/macos-arm64/construct-tui
+          tar -czf construct-tui-linux-x86_64.tar.gz -C dist/linux-x86_64 construct-tui
+          tar -czf construct-tui-linux-aarch64.tar.gz -C dist/linux-aarch64 construct-tui
+          tar -czf construct-tui-macos-arm64.tar.gz   -C dist/macos-arm64  construct-tui
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            construct-tui-linux-x86_64.tar.gz
+            construct-tui-linux-aarch64.tar.gz
+            construct-tui-macos-arm64.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
