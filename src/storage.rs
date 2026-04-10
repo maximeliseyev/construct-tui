@@ -222,6 +222,20 @@ impl Storage {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    pub fn get_contact_by_id(&self, user_id: &str) -> Result<Option<StoredContact>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT user_id, display_name, identity_key_b64 FROM contacts WHERE user_id = ?1",
+        )?;
+        let mut rows = stmt.query_map([user_id], |row| {
+            Ok(StoredContact {
+                user_id: row.get(0)?,
+                display_name: row.get(1)?,
+                identity_key_b64: row.get(2)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
     // ── ACK store ─────────────────────────────────────────────────────────────
 
     pub fn store_ack(&self, message_id: &str, timestamp_ms: i64) -> Result<()> {

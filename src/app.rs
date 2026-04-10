@@ -1,4 +1,5 @@
 use anyhow::Result;
+use base64::Engine as _;
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
@@ -146,6 +147,9 @@ pub struct App {
     device_id: String,
     /// Bearer token for gRPC calls (set after successful auth, refreshed on token refresh).
     access_token: String,
+    /// Our X3DH identity public key bytes — captured at orchestrator startup, used for
+    /// safety number display and key export. None before first login.
+    our_identity_key: Option<Vec<u8>>,
 }
 
 impl App {
@@ -195,6 +199,7 @@ impl App {
             read_storage: None,
             device_id: String::new(),
             access_token: String::new(),
+            our_identity_key: None,
         }
     }
 
@@ -548,6 +553,9 @@ impl App {
 
         // ── Generate OTPKs before moving orchestrator into task ───────────────
         let otpks = orchestrator.generate_otpks(100).unwrap_or_default();
+
+        // Capture our identity public key before the orchestrator is moved into the task.
+        self.our_identity_key = orchestrator.identity_public_key_bytes().ok();
 
         // ── Spawn gRPC stream worker subscribed to known contacts ─────────────
         let (stream_tx, mut stream_rx) =
@@ -1061,21 +1069,10 @@ impl App {
                         SettingsAction::Back => self.screen = Screen::Main,
                         SettingsAction::Logout => self.do_logout(),
                         SettingsAction::ShowSafetyNumber => {
-                            let contact_name = self
-                                .chat_list
-                                .selected_contact()
-                                .map(|c| c.display_name.clone())
-                                .unwrap_or_else(|| "Unknown".into());
-                            // TODO: replace with real identity keys from Orchestrator
-                            let our_key = [0u8; 32];
-                            let their_key = [1u8; 32];
-                            self.safety_number =
-                                Some(SafetyNumberScreen::new(contact_name, &our_key, &their_key));
-                            self.screen = Screen::SafetyNumber;
+                            self.open_safety_number_screen();
                         }
                         SettingsAction::ExportKeys => {
-                            // TODO: export identity keys to file
-                            self.status = "Key export not yet implemented".into();
+                            self.export_identity_key();
                         }
                     }
                 }
@@ -1083,19 +1080,69 @@ impl App {
             // Shortcut keys
             KeyCode::Char('l') | KeyCode::Char('L') => self.do_logout(),
             KeyCode::Char('s') | KeyCode::Char('S') => {
-                // Trigger ShowSafetyNumber directly
-                let contact_name = self
-                    .chat_list
-                    .selected_contact()
-                    .map(|c| c.display_name.clone())
-                    .unwrap_or_else(|| "Unknown".into());
-                let our_key = [0u8; 32];
-                let their_key = [1u8; 32];
-                self.safety_number =
-                    Some(SafetyNumberScreen::new(contact_name, &our_key, &their_key));
-                self.screen = Screen::SafetyNumber;
+                self.open_safety_number_screen();
             }
             _ => {}
+        }
+    }
+
+    fn open_safety_number_screen(&mut self) {
+        let Some(contact) = self.chat_list.selected_contact() else {
+            self.status = "Select a contact first".into();
+            return;
+        };
+        let contact_name = contact.display_name.clone();
+        let contact_id = contact.id.clone();
+
+        let our_key = match &self.our_identity_key {
+            Some(k) => vec_to_key32(k),
+            None => {
+                self.status = "Identity key not available".into();
+                return;
+            }
+        };
+
+        // Look up peer's identity key from DB (empty string → key not yet fetched).
+        let their_key: [u8; 32] = self
+            .read_storage
+            .as_ref()
+            .and_then(|s| s.get_contact_by_id(&contact_id).ok().flatten())
+            .and_then(|c| {
+                if c.identity_key_b64.is_empty() {
+                    None
+                } else {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(&c.identity_key_b64)
+                        .ok()
+                        .map(|v| vec_to_key32(&v))
+                }
+            })
+            .unwrap_or([0u8; 32]);
+
+        self.safety_number = Some(SafetyNumberScreen::new(contact_name, &our_key, &their_key));
+        self.screen = Screen::SafetyNumber;
+    }
+
+    fn export_identity_key(&mut self) {
+        let key = match &self.our_identity_key {
+            Some(k) => k.clone(),
+            None => {
+                self.status = "Identity key not available".into();
+                return;
+            }
+        };
+        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        let path = format!(
+            "{}/construct_identity_{}.txt",
+            std::env::var("HOME").unwrap_or_else(|_| ".".into()),
+            &self.user_id,
+        );
+        match std::fs::write(
+            &path,
+            format!("identity_public_key_hex={hex}\nuser_id={}\n", self.user_id),
+        ) {
+            Ok(()) => self.status = format!("Key exported → {path}"),
+            Err(e) => self.status = format!("Export failed: {e}"),
         }
     }
 
@@ -1105,7 +1152,6 @@ impl App {
                 self.contact_search.reset();
                 self.screen = Screen::Main;
             }
-            KeyCode::Up | KeyCode::Char('k') => self.contact_search.prev(),
             KeyCode::Down | KeyCode::Char('j') => self.contact_search.next(),
             KeyCode::Enter => {
                 let query = self.contact_search.query.trim().to_string();
@@ -1197,6 +1243,7 @@ impl App {
         self.session_key = None;
         self.current_session = None;
         self.pending_session = None;
+        self.our_identity_key = None;
         self.user_id = String::new();
         self.device_id = String::new();
         self.access_token = String::new();
@@ -1348,4 +1395,12 @@ fn transport_label(t: &TransportConfig) -> &'static str {
         TransportConfig::Obfs4Tls { .. } => "obfs4+tls",
         TransportConfig::CdnFront { .. } => "cdn-front",
     }
+}
+
+/// Truncate or zero-pad a key slice to exactly 32 bytes.
+fn vec_to_key32(v: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let len = v.len().min(32);
+    out[..len].copy_from_slice(&v[..len]);
+    out
 }
