@@ -124,6 +124,7 @@ async fn main() -> Result<()> {
         transport,
         no_encrypt,
         headless: cli.headless,
+        pq_active: cli.post_quantum,
     };
 
     let mut terminal = tui::init()?;

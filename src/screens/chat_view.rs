@@ -26,11 +26,12 @@ pub struct ChatViewPane {
     pub compose: String,
     pub focused: bool,
     pub compose_focused: bool,
+    /// How many messages to skip from the bottom (0 = show latest).
+    scroll_offset: usize,
 }
 
 impl ChatViewPane {
     pub fn new(contact_name: impl Into<String>) -> Self {
-        // Placeholder messages for skeleton UI
         let messages = vec![
             ChatMessage {
                 id: "1".into(),
@@ -57,6 +58,7 @@ impl ChatViewPane {
             compose: String::new(),
             focused: false,
             compose_focused: false,
+            scroll_offset: 0,
         }
     }
 
@@ -70,6 +72,37 @@ impl ChatViewPane {
 
     pub fn take_compose(&mut self) -> String {
         std::mem::take(&mut self.compose)
+    }
+
+    /// Scroll up by `n` messages (older messages).
+    pub fn scroll_up(&mut self, n: usize) {
+        let max_offset = self.messages.len().saturating_sub(1);
+        self.scroll_offset = (self.scroll_offset + n).min(max_offset);
+    }
+
+    /// Scroll down by `n` messages (newer messages).
+    pub fn scroll_down(&mut self, n: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(n);
+    }
+
+    /// Jump to the oldest message.
+    pub fn scroll_to_top(&mut self) {
+        self.scroll_offset = self.messages.len().saturating_sub(1);
+    }
+
+    /// Jump to the latest message (default view).
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_offset = 0;
+    }
+
+    /// Reset scroll when a new message arrives (auto-scroll to bottom, unless the user scrolled up).
+    pub fn on_new_message(&mut self) {
+        if self.scroll_offset == 0 {
+            // Already at bottom — keep it that way.
+        } else {
+            // User is reading history — don't auto-scroll, just bump offset so they stay in place.
+            self.scroll_offset += 1;
+        }
     }
 }
 
@@ -96,9 +129,27 @@ impl Widget for &mut ChatViewPane {
             .constraints([Constraint::Min(1), Constraint::Length(3)])
             .split(inner);
 
-        // Messages
-        let msg_lines: Vec<Line> = self
-            .messages
+        let msg_area_height = chunks[0].height as usize;
+        let total = self.messages.len();
+
+        // Determine the visible window.
+        // scroll_offset=0 → show the last N messages.
+        let end = total.saturating_sub(self.scroll_offset);
+        let start = end.saturating_sub(msg_area_height);
+
+        let visible = &self.messages[start..end];
+
+        // Scroll indicator (shown when not at the latest).
+        let scroll_hint = if self.scroll_offset > 0 {
+            Some(format!(
+                "  ↑ {} older  PgUp/PgDn  End=latest",
+                self.scroll_offset
+            ))
+        } else {
+            None
+        };
+
+        let mut msg_lines: Vec<Line> = visible
             .iter()
             .map(|m| {
                 if m.kind == MessageKind::Sent {
@@ -112,7 +163,6 @@ impl Widget for &mut ChatViewPane {
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD),
                     );
-                    // Right-aligned feel: pad with spaces before
                     Line::from(vec![Span::raw("  "), text, Span::raw("  "), time])
                 } else {
                     let time = Span::styled(
@@ -124,6 +174,14 @@ impl Widget for &mut ChatViewPane {
                 }
             })
             .collect();
+
+        // Append scroll hint at the bottom if scrolled up.
+        if let Some(hint) = scroll_hint {
+            msg_lines.push(Line::from(Span::styled(
+                hint,
+                Style::default().fg(Color::Yellow),
+            )));
+        }
 
         Paragraph::new(msg_lines)
             .wrap(Wrap { trim: false })

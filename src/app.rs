@@ -17,7 +17,9 @@ use crate::{
     event::{Event, EventHandler, is_quit},
     screens::onboarding::OnboardingField,
     screens::{
-        ChatListPane, ChatViewPane, DeviceLinkScreen, OnboardingScreen, UnlockMode, UnlockScreen,
+        ChatListPane, ChatViewPane, ConnectionState, ContactSearchScreen, DeviceLinkScreen,
+        OnboardingScreen, SafetyNumberScreen, SettingsAction, SettingsScreen, StatusBar,
+        UnlockMode, UnlockScreen,
     },
     tui::Tui,
 };
@@ -40,6 +42,12 @@ enum Screen {
     AuthError(String),
     /// Authenticated — show main chat UI.
     Main,
+    /// Settings (server, transport, device ID, logout, safety number…).
+    Settings,
+    /// Add-contact search overlay.
+    ContactSearch,
+    /// Safety number verification for the currently selected contact.
+    SafetyNumber,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -74,6 +82,7 @@ pub struct AppConfig {
     pub transport: TransportConfig,
     pub no_encrypt: bool,
     pub headless: bool,
+    pub pq_active: bool,
 }
 
 pub struct App {
@@ -97,6 +106,16 @@ pub struct App {
     internal_rx: mpsc::UnboundedReceiver<InternalEvent>,
     server_url: String,
     transport: TransportConfig,
+    /// Authenticated user ID (set after successful auth).
+    user_id: String,
+    /// Whether Kyber-768 PQXDH is active for this session.
+    pq_active: bool,
+    /// Live connection state shown in the status bar.
+    connection: ConnectionState,
+    settings_screen: SettingsScreen,
+    contact_search: ContactSearchScreen,
+    /// Safety number widget for the currently selected contact.
+    safety_number: Option<SafetyNumberScreen>,
 }
 
 impl App {
@@ -108,6 +127,14 @@ impl App {
             .unwrap_or_default();
 
         let (internal_tx, internal_rx) = mpsc::unbounded_channel();
+
+        let settings_screen = SettingsScreen::new(
+            &cfg.server_url,
+            transport_label(&cfg.transport),
+            "—",
+            "—",
+            cfg.pq_active,
+        );
 
         Self {
             screen: Screen::Startup,
@@ -126,6 +153,12 @@ impl App {
             internal_rx,
             server_url: cfg.server_url,
             transport: cfg.transport,
+            user_id: String::new(),
+            pq_active: cfg.pq_active,
+            connection: ConnectionState::default(),
+            settings_screen,
+            contact_search: ContactSearchScreen::new(),
+            safety_number: None,
         }
     }
 
@@ -252,8 +285,22 @@ impl App {
                 pending_save,
             } => {
                 self.status = format!("Connected as {}", user_id);
+                self.user_id = user_id.clone();
+                self.connection = ConnectionState::Connected {
+                    transport: transport_label(&self.transport).into(),
+                    latency_ms: None,
+                };
 
                 if let Some(session) = pending_save {
+                    // Update settings with real device ID now that we have it.
+                    self.settings_screen.update(
+                        &self.server_url,
+                        transport_label(&self.transport),
+                        &session.device_id,
+                        &user_id,
+                        self.pq_active,
+                    );
+
                     self.start_token_refresh(&session);
 
                     if let Some(ref passphrase) = self.session_passphrase {
@@ -272,6 +319,13 @@ impl App {
                         self.screen = Screen::SetPassphrase;
                     }
                 } else {
+                    self.settings_screen.update(
+                        &self.server_url,
+                        transport_label(&self.transport),
+                        "—",
+                        &user_id,
+                        self.pq_active,
+                    );
                     self.screen = Screen::Main;
                 }
             }
@@ -339,6 +393,7 @@ impl App {
                     text,
                     time: current_time_hhmm(),
                 });
+                self.chat_view.on_new_message();
             }
             BridgeEvent::MessageDelivered { message_id: _ } => {
                 // TODO: update delivery indicator
@@ -424,6 +479,17 @@ impl App {
         }
         if matches!(self.screen, Screen::Main) {
             return self.handle_main(key);
+        }
+        if matches!(self.screen, Screen::Settings) {
+            return self.handle_settings(key);
+        }
+        if matches!(self.screen, Screen::ContactSearch) {
+            return self.handle_contact_search(key);
+        }
+        if matches!(self.screen, Screen::SafetyNumber) {
+            // Any key exits safety number back to settings.
+            self.screen = Screen::Settings;
+            return;
         }
     }
 
@@ -569,12 +635,27 @@ impl App {
                     }
                     self.set_focus(Focus::ChatView);
                 }
+                // Open settings
+                KeyCode::Char('s') if key.modifiers == crossterm::event::KeyModifiers::NONE => {
+                    self.screen = Screen::Settings;
+                }
+                // Add contact / search
+                KeyCode::Char('n') if key.modifiers == crossterm::event::KeyModifiers::NONE => {
+                    self.contact_search.reset();
+                    self.screen = Screen::ContactSearch;
+                }
                 _ => {}
             },
             Focus::ChatView => match key.code {
                 KeyCode::Tab | KeyCode::Char('i') => self.set_focus(Focus::Compose),
                 KeyCode::BackTab => self.set_focus(Focus::ContactList),
                 KeyCode::Esc => self.set_focus(Focus::ContactList),
+                KeyCode::PageUp | KeyCode::Char('u') => self.chat_view.scroll_up(10),
+                KeyCode::PageDown | KeyCode::Char('d') => self.chat_view.scroll_down(10),
+                KeyCode::Up | KeyCode::Char('k') => self.chat_view.scroll_up(1),
+                KeyCode::Down | KeyCode::Char('j') => self.chat_view.scroll_down(1),
+                KeyCode::Home => self.chat_view.scroll_to_top(),
+                KeyCode::End => self.chat_view.scroll_to_bottom(),
                 _ => {}
             },
             Focus::Compose => match key.code {
@@ -606,6 +687,125 @@ impl App {
         self.focus = f;
     }
 
+    fn handle_settings(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.screen = Screen::Main,
+            KeyCode::Up | KeyCode::Char('k') => self.settings_screen.prev(),
+            KeyCode::Down | KeyCode::Char('j') => self.settings_screen.next(),
+            KeyCode::Enter => {
+                if let Some(action) = self.settings_screen.confirm() {
+                    match action {
+                        SettingsAction::Back => self.screen = Screen::Main,
+                        SettingsAction::Logout => self.do_logout(),
+                        SettingsAction::ShowSafetyNumber => {
+                            let contact_name = self
+                                .chat_list
+                                .selected_contact()
+                                .map(|c| c.display_name.clone())
+                                .unwrap_or_else(|| "Unknown".into());
+                            // TODO: replace with real identity keys from Orchestrator
+                            let our_key = [0u8; 32];
+                            let their_key = [1u8; 32];
+                            self.safety_number = Some(SafetyNumberScreen::new(
+                                contact_name,
+                                &our_key,
+                                &their_key,
+                            ));
+                            self.screen = Screen::SafetyNumber;
+                        }
+                        SettingsAction::ExportKeys => {
+                            // TODO: export identity keys to file
+                            self.status = "Key export not yet implemented".into();
+                        }
+                    }
+                }
+            }
+            // Shortcut keys
+            KeyCode::Char('l') | KeyCode::Char('L') => self.do_logout(),
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                self.settings_screen.confirm().map(|_| ());
+                // Trigger ShowSafetyNumber directly
+                let contact_name = self
+                    .chat_list
+                    .selected_contact()
+                    .map(|c| c.display_name.clone())
+                    .unwrap_or_else(|| "Unknown".into());
+                let our_key = [0u8; 32];
+                let their_key = [1u8; 32];
+                self.safety_number = Some(SafetyNumberScreen::new(contact_name, &our_key, &their_key));
+                self.screen = Screen::SafetyNumber;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_contact_search(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.contact_search.reset();
+                self.screen = Screen::Main;
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.contact_search.prev(),
+            KeyCode::Down | KeyCode::Char('j') => self.contact_search.next(),
+            KeyCode::Enter => {
+                if self.contact_search.results.is_empty() {
+                    // No results yet — trigger search
+                    let query = self.contact_search.query.trim().to_string();
+                    if !query.is_empty() {
+                        self.contact_search.searching = true;
+                        // TODO: dispatch gRPC SearchUsers(query) → call set_results / set_error
+                        self.contact_search.set_error("Search not yet connected to gRPC");
+                    }
+                } else {
+                    // Results visible — Enter = search again
+                    let query = self.contact_search.query.trim().to_string();
+                    if !query.is_empty() {
+                        self.contact_search.searching = true;
+                        self.contact_search.set_error("Search not yet connected to gRPC");
+                    }
+                }
+            }
+            KeyCode::Tab => self.contact_search.next(),
+            KeyCode::BackTab => self.contact_search.prev(),
+            // Ctrl+A — add selected contact
+            KeyCode::Char('a') if key.modifiers == crossterm::event::KeyModifiers::CONTROL => {
+                if let Some(result) = self.contact_search.selected().cloned() {
+                    // TODO: dispatch gRPC AddContact(result.user_id)
+                    self.status = format!("Add contact '{}' — not yet implemented", result.username);
+                    self.contact_search.reset();
+                    self.screen = Screen::Main;
+                }
+            }
+            KeyCode::Backspace => self.contact_search.pop_char(),
+            KeyCode::Char(c) => self.contact_search.push_char(c),
+            _ => {}
+        }
+    }
+
+    /// Clear session from disk and reset to onboarding state.
+    fn do_logout(&mut self) {
+        if let Err(e) = config::clear_session() {
+            self.status = format!("Logout error: {e}");
+            return;
+        }
+        self.session_passphrase = None;
+        self.pending_session = None;
+        self.user_id = String::new();
+        self.connection = ConnectionState::Disconnected;
+        self.contact_search.reset();
+        self.chat_list = ChatListPane::new();
+        self.chat_view = ChatViewPane::new(String::new());
+        self.settings_screen = SettingsScreen::new(
+            &self.server_url,
+            transport_label(&self.transport),
+            "—",
+            "—",
+            self.pq_active,
+        );
+        self.onboarding = OnboardingScreen::new();
+        self.screen = Screen::Onboarding;
+    }
+
     // ── Rendering ───────────────────────────────────────────────────────────────
 
     fn render(&mut self, frame: &mut Frame) {
@@ -613,6 +813,19 @@ impl App {
 
         if matches!(self.screen, Screen::Main) {
             return self.render_main(frame);
+        }
+        if matches!(self.screen, Screen::Settings) {
+            return frame.render_widget(&mut self.settings_screen, area);
+        }
+        if matches!(self.screen, Screen::ContactSearch) {
+            return frame.render_widget(&mut self.contact_search, area);
+        }
+        if matches!(self.screen, Screen::SafetyNumber) {
+            if let Some(ref sn) = self.safety_number {
+                return frame.render_widget(sn, area);
+            }
+            self.screen = Screen::Settings;
+            return frame.render_widget(&mut self.settings_screen, area);
         }
         if matches!(self.screen, Screen::DeviceLink) {
             return frame.render_widget(&self.device_link, area);
@@ -686,7 +899,7 @@ impl App {
             Span::styled("TUI", Style::default().fg(Color::White)),
             Span::raw("  "),
             Span::styled(
-                "Tab=switch  ↑↓/jk=navigate  i=compose  Esc=back  q=quit",
+                "Tab=switch  ↑↓/jk=nav  i=compose  s=settings  n=add node  q=quit",
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
@@ -697,11 +910,13 @@ impl App {
         frame.render_widget(&mut self.chat_list, body[0]);
         frame.render_widget(&mut self.chat_view, body[1]);
 
-        let status = Paragraph::new(Line::from(vec![
-            Span::styled(" ● ", Style::default().fg(Color::Green)),
-            Span::raw(&self.status),
-        ]));
-        frame.render_widget(status, root[2]);
+        let status_bar = StatusBar {
+            connection: &self.connection,
+            status_text: &self.status,
+            unread_count: 0,
+            pq_active: self.pq_active,
+        };
+        frame.render_widget(status_bar, root[2]);
     }
 }
 
@@ -715,4 +930,13 @@ fn current_time_hhmm() -> String {
         .unwrap_or_default()
         .as_secs();
     format!("{:02}:{:02}", (secs % 86400) / 3600, (secs % 3600) / 60)
+}
+
+fn transport_label(t: &TransportConfig) -> &'static str {
+    match t {
+        TransportConfig::Direct => "direct",
+        TransportConfig::Obfs4 { .. } => "obfs4",
+        TransportConfig::Obfs4Tls { .. } => "obfs4+tls",
+        TransportConfig::CdnFront { .. } => "cdn-front",
+    }
 }

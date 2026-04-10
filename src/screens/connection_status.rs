@@ -1,0 +1,106 @@
+//! Connection state tracking and status bar widget.
+
+use std::time::{Duration, Instant};
+
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Color, Style},
+    text::{Line, Span},
+    widgets::{Paragraph, Widget},
+};
+
+/// Live connection state — updated by the streaming worker via InternalEvent.
+#[derive(Debug, Clone)]
+pub enum ConnectionState {
+    /// Not yet connected (startup).
+    Disconnected,
+    /// Currently establishing the connection.
+    Connecting { transport: String },
+    /// Fully connected.
+    Connected { transport: String, latency_ms: Option<u32> },
+    /// Lost connection, trying to restore.
+    Reconnecting { attempt: u32, next_retry: Instant, interval: Duration },
+}
+
+impl Default for ConnectionState {
+    fn default() -> Self {
+        Self::Disconnected
+    }
+}
+
+impl ConnectionState {
+    /// Short human-readable label for the status bar.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Disconnected => "✗ disconnected".into(),
+            Self::Connecting { transport } => format!("⠋ connecting ({transport})…"),
+            Self::Connected { transport, latency_ms: Some(ms) } => {
+                format!("● {transport}  {ms}ms")
+            }
+            Self::Connected { transport, latency_ms: None } => {
+                format!("● {transport}")
+            }
+            Self::Reconnecting { attempt, next_retry, interval } => {
+                let secs_left = next_retry
+                    .saturating_duration_since(Instant::now())
+                    .as_secs();
+                let _ = interval; // used for display elsewhere
+                format!("↺ reconnecting (attempt {attempt}, retry in {secs_left}s)")
+            }
+        }
+    }
+
+    pub fn color(&self) -> Color {
+        match self {
+            Self::Connected { .. } => Color::Green,
+            Self::Reconnecting { .. } => Color::Yellow,
+            Self::Connecting { .. } => Color::Cyan,
+            Self::Disconnected => Color::Red,
+        }
+    }
+}
+
+/// Single-line status bar rendered at the bottom of the main view.
+pub struct StatusBar<'a> {
+    pub connection: &'a ConnectionState,
+    pub status_text: &'a str,
+    pub unread_count: usize,
+    pub pq_active: bool,
+}
+
+impl Widget for StatusBar<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let conn_label = self.connection.label();
+        let conn_color = self.connection.color();
+
+        let pq_badge = if self.pq_active {
+            Span::styled(" [PQ] ", Style::default().fg(Color::Magenta))
+        } else {
+            Span::raw("")
+        };
+
+        let unread = if self.unread_count > 0 {
+            Span::styled(
+                format!(" {} unread ", self.unread_count),
+                Style::default().fg(Color::Yellow),
+            )
+        } else {
+            Span::raw("")
+        };
+
+        let sep = Span::styled(" │ ", Style::default().fg(Color::DarkGray));
+
+        let line = Line::from(vec![
+            Span::styled(" ", Style::default()),
+            Span::styled(&conn_label, Style::default().fg(conn_color)),
+            pq_badge,
+            sep.clone(),
+            unread,
+            sep,
+            Span::styled(self.status_text, Style::default().fg(Color::DarkGray)),
+        ]);
+
+        Paragraph::new(line).render(area, buf);
+    }
+}
