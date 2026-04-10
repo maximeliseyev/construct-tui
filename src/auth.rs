@@ -4,22 +4,19 @@
 //! On returning: load Session → AuthenticateDevice → update tokens.
 
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use construct_core::{
     crypto::{
-        keys::{build_prologue, Ed25519KeyPair, X25519KeyPair},
         SuiteID,
+        keys::{Ed25519KeyPair, X25519KeyPair, build_prologue},
     },
     device_id::derive_device_id,
 };
 use ed25519_dalek::Signer;
 
 use crate::{
-    config::{load_session, save_session, Session},
-    grpc::{
-        services::DevicePublicKeys,
-        ConstructClient,
-    },
+    config::{Session, load_session, save_session},
+    grpc::{ConstructClient, services::DevicePublicKeys},
 };
 
 /// Result of a successful auth (returned to the UI layer).
@@ -67,10 +64,7 @@ pub async fn try_restore_session(server_url: &str) -> Result<Option<AuthResult>>
 
 /// Register a brand-new device and save the resulting session.
 /// `username` is optional (display name hint sent to the server).
-pub async fn register_new_device(
-    server_url: &str,
-    username: Option<&str>,
-) -> Result<AuthResult> {
+pub async fn register_new_device(server_url: &str, username: Option<&str>) -> Result<AuthResult> {
     // 1. Generate device keys
     let signing_pair = Ed25519KeyPair::generate();
     let identity_pair = X25519KeyPair::generate();

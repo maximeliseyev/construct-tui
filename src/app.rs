@@ -16,7 +16,9 @@ use crate::{
     config::{self, Session, SessionState, TransportConfig},
     event::{Event, EventHandler, is_quit},
     screens::onboarding::OnboardingField,
-    screens::{ChatListPane, ChatViewPane, DeviceLinkScreen, OnboardingScreen, UnlockMode, UnlockScreen},
+    screens::{
+        ChatListPane, ChatViewPane, DeviceLinkScreen, OnboardingScreen, UnlockMode, UnlockScreen,
+    },
     tui::Tui,
 };
 
@@ -51,7 +53,10 @@ enum Focus {
 #[derive(Debug)]
 enum AuthMsg {
     /// Authentication succeeded.
-    Success { user_id: String, pending_save: Option<Session> },
+    Success {
+        user_id: String,
+        pending_save: Option<Session>,
+    },
     Failure(String),
 }
 
@@ -165,7 +170,10 @@ impl App {
         let url = self.server_url.clone();
         tokio::spawn(async move {
             let msg = match crate::auth::try_restore_session(&url).await {
-                Ok(Some(r)) => AuthMsg::Success { user_id: r.user_id, pending_save: None },
+                Ok(Some(r)) => AuthMsg::Success {
+                    user_id: r.user_id,
+                    pending_save: None,
+                },
                 Ok(None) => AuthMsg::Failure("no_session".into()),
                 Err(e) => AuthMsg::Failure(e.to_string()),
             };
@@ -180,7 +188,10 @@ impl App {
         let url = self.server_url.clone();
         tokio::spawn(async move {
             let msg = match crate::auth::authenticate_saved_session(session, &url).await {
-                Ok(r) => AuthMsg::Success { user_id: r.user_id, pending_save: r.session },
+                Ok(r) => AuthMsg::Success {
+                    user_id: r.user_id,
+                    pending_save: r.session,
+                },
                 Err(e) => AuthMsg::Failure(e.to_string()),
             };
             let _ = tx.send(InternalEvent::Auth(msg));
@@ -191,10 +202,17 @@ impl App {
     fn start_auth_register(&mut self, username: String) {
         let tx = self.internal_tx.clone();
         let url = self.server_url.clone();
-        let name = if username.is_empty() { None } else { Some(username) };
+        let name = if username.is_empty() {
+            None
+        } else {
+            Some(username)
+        };
         tokio::spawn(async move {
             let msg = match crate::auth::register_new_device(&url, name.as_deref()).await {
-                Ok(r) => AuthMsg::Success { user_id: r.user_id, pending_save: r.session },
+                Ok(r) => AuthMsg::Success {
+                    user_id: r.user_id,
+                    pending_save: r.session,
+                },
                 Err(e) => AuthMsg::Failure(e.to_string()),
             };
             let _ = tx.send(InternalEvent::Auth(msg));
@@ -207,7 +225,10 @@ impl App {
         let url = self.server_url.clone();
         tokio::spawn(async move {
             let msg = match crate::auth::link_existing_device(&url, &token).await {
-                Ok(r) => AuthMsg::Success { user_id: r.user_id, pending_save: r.session },
+                Ok(r) => AuthMsg::Success {
+                    user_id: r.user_id,
+                    pending_save: r.session,
+                },
                 Err(e) => AuthMsg::Failure(e.to_string()),
             };
             let _ = tx.send(InternalEvent::Auth(msg));
@@ -226,7 +247,10 @@ impl App {
 
     fn handle_auth_msg(&mut self, msg: AuthMsg) {
         match msg {
-            AuthMsg::Success { user_id, pending_save } => {
+            AuthMsg::Success {
+                user_id,
+                pending_save,
+            } => {
                 self.status = format!("Connected as {}", user_id);
 
                 if let Some(session) = pending_save {
@@ -235,16 +259,12 @@ impl App {
                     if let Some(ref passphrase) = self.session_passphrase {
                         match config::save_session_encrypted(&session, passphrase) {
                             Ok(()) => self.screen = Screen::Main,
-                            Err(e) => {
-                                self.screen = Screen::AuthError(format!("Save failed: {e}"))
-                            }
+                            Err(e) => self.screen = Screen::AuthError(format!("Save failed: {e}")),
                         }
                     } else if self.no_encrypt {
                         match config::save_session(&session) {
                             Ok(()) => self.screen = Screen::Main,
-                            Err(e) => {
-                                self.screen = Screen::AuthError(format!("Save failed: {e}"))
-                            }
+                            Err(e) => self.screen = Screen::AuthError(format!("Save failed: {e}")),
                         }
                     } else {
                         self.pending_session = Some(session);
@@ -288,7 +308,11 @@ impl App {
 
     fn handle_token_refresh_msg(&mut self, msg: TokenRefreshMsg) {
         match msg {
-            TokenRefreshMsg::Refreshed { access_token, refresh_token, expires_at } => {
+            TokenRefreshMsg::Refreshed {
+                access_token,
+                refresh_token,
+                expires_at,
+            } => {
                 let updated = self.build_updated_session(access_token, refresh_token, expires_at);
                 if let Some(session) = updated {
                     self.persist_session_background(session);
@@ -302,7 +326,12 @@ impl App {
 
     fn handle_bridge_event(&mut self, evt: BridgeEvent) {
         match evt {
-            BridgeEvent::NewMessage { peer_id: _, message_id: _, text, timestamp_ms: _ } => {
+            BridgeEvent::NewMessage {
+                peer_id: _,
+                message_id: _,
+                text,
+                timestamp_ms: _,
+            } => {
                 use crate::screens::chat_view::{ChatMessage, MessageKind};
                 self.chat_view.messages.push(ChatMessage {
                     id: generate_message_id(),
@@ -459,7 +488,9 @@ impl App {
                         self.start_auth_restore_preloaded(session);
                     }
                     Ok(None) => self.unlock_screen.set_error("No session found"),
-                    Err(_) => self.unlock_screen.set_error("Wrong passphrase or corrupted session"),
+                    Err(_) => self
+                        .unlock_screen
+                        .set_error("Wrong passphrase or corrupted session"),
                 }
             }
             _ => {}
@@ -505,7 +536,8 @@ impl App {
             KeyCode::Enter => {
                 let token = self.device_link.token.trim().to_string();
                 if token.is_empty() {
-                    self.device_link.set_status("Paste the link token first", true);
+                    self.device_link
+                        .set_status("Paste the link token first", true);
                 } else {
                     self.device_link.clear_status();
                     self.start_auth_link(token);

@@ -108,15 +108,12 @@ impl Widget for &mut ChatViewPane {
                     );
                     let text = Span::styled(
                         &m.text,
-                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
                     );
                     // Right-aligned feel: pad with spaces before
-                    Line::from(vec![
-                        Span::raw("  "),
-                        text,
-                        Span::raw("  "),
-                        time,
-                    ])
+                    Line::from(vec![Span::raw("  "), text, Span::raw("  "), time])
                 } else {
                     let time = Span::styled(
                         format!("[{}] ", m.time),

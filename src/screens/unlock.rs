@@ -103,8 +103,20 @@ impl Widget for &UnlockScreen {
         let tw = title.len() as u16;
         let tx = area.x + area.width.saturating_sub(tw) / 2;
         Paragraph::new(title)
-            .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-            .render(Rect { x: tx, y, width: tw.min(area.width), height: 1 }, buf);
+            .style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .render(
+                Rect {
+                    x: tx,
+                    y,
+                    width: tw.min(area.width),
+                    height: 1,
+                },
+                buf,
+            );
         y += 2;
 
         // ── Subtitle ──────────────────────────────────────────────────────────
@@ -112,7 +124,15 @@ impl Widget for &UnlockScreen {
         let sx = area.x + area.width.saturating_sub(sw) / 2;
         Paragraph::new(subtitle)
             .style(Style::default().fg(Color::DarkGray))
-            .render(Rect { x: sx, y, width: sw.min(area.width), height: 1 }, buf);
+            .render(
+                Rect {
+                    x: sx,
+                    y,
+                    width: sw.min(area.width),
+                    height: 1,
+                },
+                buf,
+            );
         y += 2;
 
         // ── Passphrase field (masked) ─────────────────────────────────────────
@@ -129,7 +149,15 @@ impl Widget for &UnlockScreen {
                     .border_style(Style::default().fg(Color::Cyan)),
             )
             .style(Style::default().fg(Color::White))
-            .render(Rect { x: field_x, y, width: field_w, height: 3 }, buf);
+            .render(
+                Rect {
+                    x: field_x,
+                    y,
+                    width: field_w,
+                    height: 3,
+                },
+                buf,
+            );
         y += 4;
 
         // ── Error or hint ─────────────────────────────────────────────────────
@@ -138,7 +166,12 @@ impl Widget for &UnlockScreen {
             Paragraph::new(err.as_str())
                 .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
                 .render(
-                    Rect { x: ex, y, width: (err.len() as u16).min(area.width), height: 1 },
+                    Rect {
+                        x: ex,
+                        y,
+                        width: (err.len() as u16).min(area.width),
+                        height: 1,
+                    },
                     buf,
                 );
             y += 2;
@@ -148,7 +181,12 @@ impl Widget for &UnlockScreen {
         Paragraph::new(hint)
             .style(Style::default().fg(Color::DarkGray))
             .render(
-                Rect { x: hx, y, width: (hint.len() as u16).min(area.width), height: 1 },
+                Rect {
+                    x: hx,
+                    y,
+                    width: (hint.len() as u16).min(area.width),
+                    height: 1,
+                },
                 buf,
             );
     }

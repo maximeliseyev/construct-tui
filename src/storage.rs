@@ -45,8 +45,8 @@ impl Storage {
     /// Open (or create) the storage database at `~/.local/share/construct-tui/messages.db`.
     pub fn open() -> Result<Self> {
         let path = db_path()?;
-        let conn = Connection::open(&path)
-            .with_context(|| format!("open db at {}", path.display()))?;
+        let conn =
+            Connection::open(&path).with_context(|| format!("open db at {}", path.display()))?;
         let storage = Self { conn };
         storage.init()?;
         Ok(storage)
@@ -65,14 +65,17 @@ impl Storage {
 
     fn init(&self) -> Result<()> {
         // Performance pragmas (RPi-friendly).
-        self.conn.execute_batch("
+        self.conn.execute_batch(
+            "
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous   = NORMAL;
             PRAGMA cache_size    = -2048;
             PRAGMA foreign_keys  = ON;
-        ")?;
+        ",
+        )?;
 
-        self.conn.execute_batch("
+        self.conn.execute_batch(
+            "
             CREATE TABLE IF NOT EXISTS messages (
                 id               TEXT PRIMARY KEY NOT NULL,
                 peer_id          TEXT NOT NULL,
@@ -109,7 +112,8 @@ impl Storage {
                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
             CREATE INDEX IF NOT EXISTS idx_records_table ON records(table_name);
-        ")?;
+        ",
+        )?;
 
         Ok(())
     }
@@ -171,7 +175,11 @@ impl Storage {
         self.conn.execute(
             "INSERT OR REPLACE INTO contacts (user_id, display_name, identity_key_b64)
              VALUES (?1, ?2, ?3)",
-            params![contact.user_id, contact.display_name, contact.identity_key_b64],
+            params![
+                contact.user_id,
+                contact.display_name,
+                contact.identity_key_b64
+            ],
         )?;
         Ok(())
     }
@@ -202,9 +210,9 @@ impl Storage {
 
     /// Drain all pending ACKs, clearing the table.
     pub fn pop_all_acks(&self) -> Result<Vec<(String, i64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT message_id, timestamp_ms FROM pending_acks",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT message_id, timestamp_ms FROM pending_acks")?;
         let rows: Vec<(String, i64)> = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
@@ -233,7 +241,8 @@ impl Storage {
     }
 
     pub fn secure_load(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        let mut stmt = self.conn
+        let mut stmt = self
+            .conn
             .prepare("SELECT value FROM secure_store WHERE key = ?1")?;
         let mut rows = stmt.query(params![key])?;
         Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
@@ -251,9 +260,9 @@ impl Storage {
 
     /// Return the most recent JSON record for a table (last insert).
     pub fn query_last_record(&self, table_name: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT json FROM records WHERE table_name = ?1 ORDER BY id DESC LIMIT 1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT json FROM records WHERE table_name = ?1 ORDER BY id DESC LIMIT 1")?;
         let mut rows = stmt.query(params![table_name])?;
         Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
     }

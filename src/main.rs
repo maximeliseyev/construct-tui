@@ -16,7 +16,10 @@ use app::{App, AppConfig};
 use config::{TransportConfig, load_config};
 
 #[derive(Parser)]
-#[command(name = "construct-tui", about = "Construct — E2EE messenger for the terminal")]
+#[command(
+    name = "construct-tui",
+    about = "Construct — E2EE messenger for the terminal"
+)]
 struct Cli {
     /// Override the server URL from config (e.g. https://ams.konstruct.cc:443)
     #[arg(long)]
@@ -45,6 +48,16 @@ struct Cli {
     #[arg(long)]
     config: Option<String>,
 
+    /// Force post-quantum (Kyber-768 PQXDH) key agreement.
+    ///
+    /// This binary must be built with the 'post-quantum' feature to use this option.
+    /// If not compiled in, the flag will print a rebuild hint and exit.
+    ///
+    /// To build a PQ-enabled binary:
+    ///   cargo build --profile release-pq --features post-quantum
+    #[arg(long)]
+    post_quantum: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -66,12 +79,36 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // --post-quantum: verify the feature is compiled in; show a helpful error if not.
+    if cli.post_quantum {
+        #[cfg(not(feature = "post-quantum"))]
+        {
+            eprintln!(
+                "error: this binary was not compiled with post-quantum support.\n\
+                 \n\
+                 To build a PQ-enabled binary, run:\n\
+                 \n  cargo build --profile release-pq --features post-quantum\n\
+                 \n\
+                 RPi 3B+ and newer handle Kyber-768 handshake in ~2–3 s.\n\
+                 RPi Zero W may take up to 60 s — this is expected."
+            );
+            std::process::exit(1);
+        }
+        #[cfg(feature = "post-quantum")]
+        {
+            eprintln!("Post-quantum (Kyber-768 PQXDH) is active.");
+        }
+    }
+
     // Load persisted config and apply CLI overrides.
     let file_config = load_config().unwrap_or_default();
 
     let transport = if let Some(bridge_line) = cli.bridge {
         if let Some(sni) = cli.bridge_tls_sni {
-            TransportConfig::Obfs4Tls { bridge_line, tls_server_name: sni }
+            TransportConfig::Obfs4Tls {
+                bridge_line,
+                tls_server_name: sni,
+            }
         } else {
             TransportConfig::Obfs4 { bridge_line }
         }
@@ -80,10 +117,14 @@ async fn main() -> Result<()> {
     };
 
     let server_url = cli.server.unwrap_or(file_config.server);
-    let no_encrypt = cli.no_encrypt
-        || std::env::var("CONSTRUCT_NO_ENCRYPT").is_ok();
+    let no_encrypt = cli.no_encrypt || std::env::var("CONSTRUCT_NO_ENCRYPT").is_ok();
 
-    let cfg = AppConfig { server_url, transport, no_encrypt, headless: cli.headless };
+    let cfg = AppConfig {
+        server_url,
+        transport,
+        no_encrypt,
+        headless: cli.headless,
+    };
 
     let mut terminal = tui::init()?;
     let result = App::new(cfg).run(&mut terminal).await;

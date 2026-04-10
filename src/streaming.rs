@@ -12,15 +12,11 @@ use tonic::{
     transport::{ClientTlsConfig, Endpoint},
 };
 
-use crate::grpc::shared::proto::services::v1::{
-    messaging_service_client::MessagingServiceClient,
-    MessageStreamRequest,
-    MessageStreamResponse,
-    message_stream_request::Request as StreamReq,
-    SubscribeRequest,
-    Heartbeat,
-};
 use crate::grpc::shared::proto::core::v1::Envelope;
+use crate::grpc::shared::proto::services::v1::{
+    Heartbeat, MessageStreamRequest, MessageStreamResponse, SubscribeRequest,
+    message_stream_request::Request as StreamReq, messaging_service_client::MessagingServiceClient,
+};
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -89,7 +85,15 @@ async fn stream_loop(
 
     loop {
         // Attempt to open the stream.
-        match run_stream(&server_url, &access_token, &subscribed_users, &mut cmd_rx, &event_tx).await {
+        match run_stream(
+            &server_url,
+            &access_token,
+            &subscribed_users,
+            &mut cmd_rx,
+            &event_tx,
+        )
+        .await
+        {
             Ok(false) => {
                 // Clean shutdown requested.
                 return;
@@ -180,7 +184,10 @@ async fn run_stream(
             .context("token header")?,
     );
 
-    let response = client.message_stream(request).await.context("message_stream RPC")?;
+    let response = client
+        .message_stream(request)
+        .await
+        .context("message_stream RPC")?;
     let mut inbound = response.into_inner();
 
     let _ = event_tx.send(StreamEvent::Connected).await;
@@ -233,7 +240,9 @@ async fn run_stream(
 
 async fn handle_server_message(resp: MessageStreamResponse, event_tx: &mpsc::Sender<StreamEvent>) {
     use crate::grpc::shared::proto::services::v1::message_stream_response::Response;
-    let Some(response) = resp.response else { return };
+    let Some(response) = resp.response else {
+        return;
+    };
     match response {
         Response::Message(envelope) => {
             let _ = event_tx.send(StreamEvent::Message(envelope)).await;
@@ -242,7 +251,10 @@ async fn handle_server_message(resp: MessageStreamResponse, event_tx: &mpsc::Sen
             let _ = event_tx.send(StreamEvent::Ack(ack.message_id)).await;
         }
         Response::Error(e) => {
-            eprintln!("[stream] server error: {:?} — {}", e.error_code, e.error_message);
+            eprintln!(
+                "[stream] server error: {:?} — {}",
+                e.error_code, e.error_message
+            );
         }
         _ => {} // receipt, typing, etc — ignored for now
     }

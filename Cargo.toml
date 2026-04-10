@@ -59,3 +59,9 @@ codegen-units = 1        # single CGU for best LTO
 strip = true             # strip symbols — saves ~2–4 MB
 panic = "abort"          # no unwinding machinery
 
+# PQ-enabled release build — same as release but with Kyber-768 PQXDH.
+# Use when the device is powerful enough (RPi 3B+ and above are fine).
+# Build: cargo build --profile release-pq --features post-quantum
+[profile.release-pq]
+inherits = "release"
+

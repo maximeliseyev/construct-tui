@@ -1,23 +1,16 @@
 use anyhow::{Context, Result};
 use ed25519_dalek::{Signer, SigningKey};
 use tonic::{
-    transport::{Channel, ClientTlsConfig, Endpoint},
     Request,
+    transport::{Channel, ClientTlsConfig, Endpoint},
 };
 
 use crate::grpc::services::{
-    auth_service_client::AuthServiceClient,
+    AuthTokensResponse, AuthenticateDeviceRequest, CheckJoinRequestStatusRequest,
+    ConfirmDeviceLinkRequest, DevicePublicKeys, GetPowChallengeRequest, JoinRequestPayload,
+    PowSolution as ProtoPowSolution, RegisterDeviceRequest, auth_service_client::AuthServiceClient,
     check_join_request_status_response::Status as JoinStatus,
     device_link_service_client::DeviceLinkServiceClient,
-    AuthenticateDeviceRequest,
-    AuthTokensResponse,
-    CheckJoinRequestStatusRequest,
-    ConfirmDeviceLinkRequest,
-    DevicePublicKeys,
-    GetPowChallengeRequest,
-    JoinRequestPayload,
-    PowSolution as ProtoPowSolution,
-    RegisterDeviceRequest,
 };
 
 /// Result of polling CheckJoinRequestStatus.
@@ -196,9 +189,9 @@ impl ConstructClient {
 
         let result = match JoinStatus::try_from(resp.status).unwrap_or(JoinStatus::Pending) {
             JoinStatus::Approved => {
-                let tokens = resp.tokens.ok_or_else(|| {
-                    anyhow::anyhow!("APPROVED status but no tokens in response")
-                })?;
+                let tokens = resp
+                    .tokens
+                    .ok_or_else(|| anyhow::anyhow!("APPROVED status but no tokens in response"))?;
                 JoinPollResult::Approved(tokens)
             }
             JoinStatus::Rejected => JoinPollResult::Rejected,

@@ -98,11 +98,15 @@ pub enum SessionState {
 
 /// Detect what kind of session file exists without loading keys.
 pub fn detect_session() -> SessionState {
-    let Ok(path) = session_path() else { return SessionState::None };
+    let Ok(path) = session_path() else {
+        return SessionState::None;
+    };
     if !path.exists() {
         return SessionState::None;
     }
-    let Ok(data) = std::fs::read_to_string(&path) else { return SessionState::None };
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return SessionState::None;
+    };
     if serde_json::from_str::<EncryptedSession>(&data).is_ok() {
         SessionState::Encrypted
     } else {
@@ -115,8 +119,8 @@ pub fn detect_session() -> SessionState {
 /// Derive a 32-byte AES key from passphrase via Argon2id.
 /// Parameters tuned for Raspberry Pi: 32 MB memory, 3 iterations, 1 thread.
 fn derive_key(passphrase: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
-    let params = Params::new(32_768, 3, 1, Some(32))
-        .map_err(|e| anyhow::anyhow!("Argon2 params: {e}"))?;
+    let params =
+        Params::new(32_768, 3, 1, Some(32)).map_err(|e| anyhow::anyhow!("Argon2 params: {e}"))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut key = Zeroizing::new([0u8; 32]);
     argon2
@@ -175,7 +179,9 @@ pub fn load_session_encrypted(passphrase: &[u8]) -> Result<Option<Session>> {
 
     let salt = B64.decode(&enc.salt).context("bad salt encoding")?;
     let nonce_bytes = B64.decode(&enc.nonce).context("bad nonce encoding")?;
-    let ciphertext = B64.decode(&enc.ciphertext).context("bad ciphertext encoding")?;
+    let ciphertext = B64
+        .decode(&enc.ciphertext)
+        .context("bad ciphertext encoding")?;
 
     let key = derive_key(passphrase, &salt)?;
     let cipher = Aes256Gcm::new_from_slice(key.as_ref())
@@ -191,14 +197,16 @@ pub fn load_session_encrypted(passphrase: &[u8]) -> Result<Option<Session>> {
     Ok(Some(session))
 }
 
-
 fn default_server() -> String {
     "https://ams.konstruct.cc:443".into()
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { server: default_server(), transport: TransportConfig::Direct }
+        Self {
+            server: default_server(),
+            transport: TransportConfig::Direct,
+        }
     }
 }
 

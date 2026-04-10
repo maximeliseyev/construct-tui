@@ -28,11 +28,16 @@ pub async fn create_channel(config: &Config) -> Result<Channel> {
         }
 
         #[cfg(feature = "ice")]
-        TransportConfig::Obfs4Tls { bridge_line, tls_server_name } => {
-            connect_via_ice(&config.server, bridge_line, Some(tls_server_name)).await
-        }
+        TransportConfig::Obfs4Tls {
+            bridge_line,
+            tls_server_name,
+        } => connect_via_ice(&config.server, bridge_line, Some(tls_server_name)).await,
 
-        TransportConfig::CdnFront { cdn_endpoint, sni_host: _, real_host: _ } => {
+        TransportConfig::CdnFront {
+            cdn_endpoint,
+            sni_host: _,
+            real_host: _,
+        } => {
             // Domain fronting: connect to the CDN endpoint which proxies to the real host.
             // The HTTP `Host` header must be set to real_host by the caller's interceptor.
             connect_direct(cdn_endpoint).await
@@ -71,8 +76,8 @@ async fn connect_via_ice(
 ) -> Result<Channel> {
     use construct_ice::{ClientConfig, transport::tonic_compat::Obfs4Channel};
 
-    let ice_config = ClientConfig::from_bridge_cert(bridge_line)
-        .context("invalid obfs4 bridge line")?;
+    let ice_config =
+        ClientConfig::from_bridge_cert(bridge_line).context("invalid obfs4 bridge line")?;
 
     let channel = Endpoint::from_shared(format!("https://{relay_addr}"))
         .context("invalid relay address")?

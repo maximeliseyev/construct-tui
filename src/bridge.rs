@@ -56,7 +56,11 @@ impl TuiBridge {
         stream_tx: mpsc::Sender<StreamCmd>,
         ui_tx: mpsc::Sender<BridgeEvent>,
     ) -> Self {
-        Self { storage: Mutex::new(storage), stream_tx, ui_tx }
+        Self {
+            storage: Mutex::new(storage),
+            stream_tx,
+            ui_tx,
+        }
     }
 
     /// Store a decrypted incoming message (called from the `MessageDecrypted` action handler).
@@ -134,7 +138,12 @@ impl PlatformBridge for TuiBridge {
     }
 
     fn load_from_secure_store(&self, key: String) -> Option<Vec<u8>> {
-        self.storage.lock().unwrap().secure_load(&key).ok().flatten()
+        self.storage
+            .lock()
+            .unwrap()
+            .secure_load(&key)
+            .ok()
+            .flatten()
     }
 
     fn persist_record(&self, table: String, json: String) {
@@ -144,7 +153,12 @@ impl PlatformBridge for TuiBridge {
     }
 
     fn query_record(&self, table: String, _query_json: String) -> Option<String> {
-        self.storage.lock().unwrap().query_last_record(&table).ok().flatten()
+        self.storage
+            .lock()
+            .unwrap()
+            .query_last_record(&table)
+            .ok()
+            .flatten()
     }
 
     fn log_event(&self, level: String, tag: String, message: String) {
@@ -178,7 +192,13 @@ pub fn spawn_token_refresh(
     expires_at: i64,
 ) -> mpsc::Receiver<TokenRefreshMsg> {
     let (tx, rx) = mpsc::channel(1);
-    tokio::spawn(token_refresh_loop(server_url, device_id, refresh_token, expires_at, tx));
+    tokio::spawn(token_refresh_loop(
+        server_url,
+        device_id,
+        refresh_token,
+        expires_at,
+        tx,
+    ));
     rx
 }
 
@@ -204,14 +224,17 @@ async fn token_refresh_loop(
     let _ = tx.send(msg).await;
 }
 
-async fn do_refresh(server_url: &str, device_id: &str, refresh_token: &str) -> Result<TokenRefreshMsg> {
+async fn do_refresh(
+    server_url: &str,
+    device_id: &str,
+    refresh_token: &str,
+) -> Result<TokenRefreshMsg> {
+    use crate::grpc::shared::proto::services::v1::{
+        RefreshTokenRequest, auth_service_client::AuthServiceClient,
+    };
     use tonic::{
         Request,
         transport::{ClientTlsConfig, Endpoint},
-    };
-    use crate::grpc::shared::proto::services::v1::{
-        auth_service_client::AuthServiceClient,
-        RefreshTokenRequest,
     };
 
     let tls = ClientTlsConfig::new().with_native_roots();

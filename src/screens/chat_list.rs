@@ -39,11 +39,18 @@ impl ChatListPane {
         ];
         let mut state = ListState::default();
         state.select(Some(0));
-        Self { contacts, state, focused: true }
+        Self {
+            contacts,
+            state,
+            focused: true,
+        }
     }
 
     pub fn next(&mut self) {
-        let i = self.state.selected().map(|i| (i + 1).min(self.contacts.len().saturating_sub(1)));
+        let i = self
+            .state
+            .selected()
+            .map(|i| (i + 1).min(self.contacts.len().saturating_sub(1)));
         self.state.select(i);
     }
 
@@ -74,12 +81,17 @@ impl StatefulWidget for &mut ChatListPane {
                 let badge = if c.unread > 0 {
                     Span::styled(
                         format!(" [{}]", c.unread),
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
                     )
                 } else {
                     Span::raw("")
                 };
-                let name = Span::styled(&c.display_name, Style::default().add_modifier(Modifier::BOLD));
+                let name = Span::styled(
+                    &c.display_name,
+                    Style::default().add_modifier(Modifier::BOLD),
+                );
                 let preview = if let Some(last) = &c.last_message {
                     let truncated = if last.chars().count() > 18 {
                         format!("{}…", last.chars().take(18).collect::<String>())
