@@ -295,9 +295,10 @@ async fn dispatch(
             let tx = self_tx.clone();
             let grpc_url = grpc_url.to_string();
             let access_token = access_token.to_string();
+            let my_uid = my_user_id.to_string();
             let uid = user_id.clone();
             tokio::spawn(async move {
-                let bundle_json = fetch_bundle_json(&grpc_url, &access_token, &uid).await;
+                let bundle_json = fetch_bundle_json(&grpc_url, &access_token, &my_uid, &uid).await;
                 let _ = tx.send(IncomingEvent::KeyBundleFetched {
                     user_id: uid,
                     bundle_json: bundle_json.unwrap_or_default(),
@@ -411,8 +412,14 @@ async fn dispatch(
 
 /// Fetch a pre-key bundle from the gRPC key service and return it as
 /// the JSON string expected by `Orchestrator::init_session_with_bundle`.
-async fn fetch_bundle_json(grpc_url: &str, access_token: &str, user_id: &str) -> Result<String> {
-    let mut client = crate::grpc::KeyUserClient::connect(grpc_url, access_token).await?;
+async fn fetch_bundle_json(
+    grpc_url: &str,
+    access_token: &str,
+    my_user_id: &str,
+    user_id: &str,
+) -> Result<String> {
+    let mut client =
+        crate::grpc::KeyUserClient::connect(grpc_url, access_token, my_user_id).await?;
     client.get_pre_key_bundle_json(user_id).await
 }
 

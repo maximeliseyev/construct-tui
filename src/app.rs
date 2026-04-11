@@ -580,7 +580,7 @@ impl App {
             self.internal_tx.clone(),
             self.server_url.clone(),
             access_token.clone(),
-            user_id,
+            user_id.clone(),
             device_id.clone(),
         );
 
@@ -592,9 +592,10 @@ impl App {
         if !otpks.is_empty() {
             let url = self.server_url.clone();
             let token = access_token.clone();
+            let uid = user_id.clone();
             let did = device_id.clone();
             tokio::spawn(async move {
-                match crate::grpc::client::KeyUserClient::connect(&url, &token).await {
+                match crate::grpc::client::KeyUserClient::connect(&url, &token, &uid).await {
                     Ok(mut client) => {
                         if let Err(e) = client.upload_pre_keys(&did, otpks).await {
                             tracing::warn!("OTPK upload failed: {e}");
@@ -1177,10 +1178,12 @@ impl App {
                     self.contact_search.searching = true;
                     let url = self.server_url.clone();
                     let token = self.access_token.clone();
+                    let uid = self.user_id.clone();
                     let tx = self.internal_tx.clone();
                     let q = query.clone();
                     tokio::spawn(async move {
-                        match crate::grpc::client::KeyUserClient::connect(&url, &token).await {
+                        match crate::grpc::client::KeyUserClient::connect(&url, &token, &uid).await
+                        {
                             Ok(mut client) => match client.find_user(&q).await {
                                 Ok(Some(user_id)) => {
                                     let _ = tx.send(InternalEvent::ContactSearchResult(vec![

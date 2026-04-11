@@ -211,10 +211,11 @@ impl ConstructClient {
 pub struct KeyUserClient {
     channel: Channel,
     access_token: String,
+    user_id: String,
 }
 
 impl KeyUserClient {
-    pub async fn connect(server_url: &str, access_token: &str) -> Result<Self> {
+    pub async fn connect(server_url: &str, access_token: &str, user_id: &str) -> Result<Self> {
         let tls = ClientTlsConfig::new().with_native_roots();
         let channel = Endpoint::from_shared(server_url.to_string())
             .context("invalid server URL")?
@@ -225,6 +226,7 @@ impl KeyUserClient {
         Ok(Self {
             channel,
             access_token: access_token.to_string(),
+            user_id: user_id.to_string(),
         })
     }
 
@@ -235,6 +237,12 @@ impl KeyUserClient {
             format!("Bearer {}", self.access_token)
                 .parse()
                 .expect("valid token chars"),
+        );
+        // Services validate caller identity from x-user-id, which is normally
+        // injected by the Envoy auth interceptor.  Direct clients must set it.
+        req.metadata_mut().insert(
+            "x-user-id",
+            self.user_id.parse().expect("valid user_id chars"),
         );
         req
     }
