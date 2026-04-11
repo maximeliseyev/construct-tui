@@ -280,6 +280,25 @@ impl Storage {
         Ok(count > 0)
     }
 
+    // ── Contact / message deletion ───────────────────────────────────────────
+
+    /// Delete a contact and all associated messages and DR session keys.
+    /// Returns the number of message rows deleted.
+    pub fn delete_contact(&self, user_id: &str) -> Result<usize> {
+        self.conn
+            .execute("DELETE FROM contacts WHERE user_id = ?1", params![user_id])?;
+        let msg_count = self
+            .conn
+            .execute("DELETE FROM messages WHERE peer_id = ?1", params![user_id])?;
+        // DR session keys stored by construct-core use keys that contain the peer UUID.
+        // Wipe all matching entries so the next init starts from a clean state.
+        self.conn.execute(
+            "DELETE FROM secure_store WHERE key LIKE '%' || ?1 || '%'",
+            params![user_id],
+        )?;
+        Ok(msg_count)
+    }
+
     // ── Secure key-value store ────────────────────────────────────────────────
 
     pub fn secure_save(&self, key: &str, value: &[u8]) -> Result<()> {

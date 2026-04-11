@@ -65,6 +65,20 @@ impl ChatListPane {
     pub fn selected_contact(&self) -> Option<&Contact> {
         self.state.selected().and_then(|i| self.contacts.get(i))
     }
+
+    /// Remove the contact at `index`. Adjusts selection so it stays in-bounds.
+    pub fn remove_at(&mut self, index: usize) {
+        if index >= self.contacts.len() {
+            return;
+        }
+        self.contacts.remove(index);
+        let new_sel = if self.contacts.is_empty() {
+            None
+        } else {
+            Some(index.min(self.contacts.len() - 1))
+        };
+        self.state.select(new_sel);
+    }
 }
 
 impl StatefulWidget for &mut ChatListPane {

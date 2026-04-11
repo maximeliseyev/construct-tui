@@ -163,6 +163,8 @@ pub struct App {
     /// Our X3DH identity public key bytes — captured at orchestrator startup, used for
     /// safety number display and key export. None before first login.
     our_identity_key: Option<Vec<u8>>,
+    /// When `Some`, a delete-confirmation dialog is shown for the given contact id.
+    delete_confirm: Option<String>,
 }
 
 impl App {
@@ -216,6 +218,7 @@ impl App {
             device_id: String::new(),
             access_token: String::new(),
             our_identity_key: None,
+            delete_confirm: None,
         }
     }
 
@@ -1041,6 +1044,16 @@ impl App {
     }
 
     fn handle_main(&mut self, key: crossterm::event::KeyEvent) {
+        // If a delete-confirm dialog is active, intercept all keys.
+        if self.delete_confirm.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.confirm_delete(),
+                _ => {
+                    self.delete_confirm = None;
+                }
+            }
+            return;
+        }
         if is_quit(&key) && self.focus != Focus::Compose {
             self.running = false;
             return;
@@ -1049,6 +1062,12 @@ impl App {
             Focus::ContactList => match key.code {
                 KeyCode::Down | KeyCode::Char('j') => self.chat_list.next(),
                 KeyCode::Up | KeyCode::Char('k') => self.chat_list.prev(),
+                // Delete selected contact (x key)
+                KeyCode::Char('x') if key.modifiers == crossterm::event::KeyModifiers::NONE => {
+                    if let Some(c) = self.chat_list.selected_contact() {
+                        self.delete_confirm = Some(c.id.clone());
+                    }
+                }
                 KeyCode::Enter | KeyCode::Tab => {
                     if let Some(c) = self.chat_list.selected_contact() {
                         self.chat_view.contact_name = c.display_name.clone();
@@ -1330,6 +1349,38 @@ impl App {
         }
     }
 
+    /// Execute a confirmed contact deletion: remove from storage, chat list, and active view.
+    fn confirm_delete(&mut self) {
+        let Some(peer_id) = self.delete_confirm.take() else {
+            return;
+        };
+        // Find the index before deleting from storage so we can remove from the list.
+        let idx = self.chat_list.contacts.iter().position(|c| c.id == peer_id);
+        let delete_result = self
+            .read_storage
+            .as_ref()
+            .map(|s| s.delete_contact(&peer_id));
+        if let Some(Err(e)) = delete_result {
+            self.status = format!("Delete failed: {e}");
+            return;
+        }
+        if let Some(i) = idx {
+            self.chat_list.remove_at(i);
+        }
+        // Clear chat view if it was showing the deleted contact.
+        if self.chat_view.contact_name == peer_id
+            || self.chat_list.contacts.iter().all(|c| c.id != peer_id)
+        {
+            self.chat_view.messages.clear();
+            self.chat_view.contact_name = self
+                .chat_list
+                .selected_contact()
+                .map(|c| c.display_name.clone())
+                .unwrap_or_default();
+        }
+        self.status = "Node removed.".into();
+    }
+
     /// Clear session from disk and reset to onboarding state.
     fn do_logout(&mut self) {
         if let Err(e) = config::clear_session() {
@@ -1371,7 +1422,12 @@ impl App {
         let area = frame.area();
 
         if matches!(self.screen, Screen::Main) {
-            return self.render_main(frame);
+            self.render_main(frame);
+            // Overlay delete confirmation dialog on top of the main view.
+            if let Some(ref peer_id) = self.delete_confirm.clone() {
+                self.render_delete_confirm(frame, peer_id);
+            }
+            return;
         }
         if matches!(self.screen, Screen::Settings) {
             return frame.render_widget(&mut self.settings_screen, area);
@@ -1520,6 +1576,36 @@ impl App {
         );
     }
 
+    /// Render a one-line delete confirmation bar at the bottom of the screen.
+    fn render_delete_confirm(&self, frame: &mut Frame, peer_id: &str) {
+        let area = frame.area();
+        let name = self
+            .chat_list
+            .contacts
+            .iter()
+            .find(|c| c.id == peer_id)
+            .map(|c| c.display_name.as_str())
+            .unwrap_or(peer_id);
+        let y = area.height.saturating_sub(2);
+        let line = Line::from(vec![
+            Span::styled("  ⚠ Remove node ", Style::default().fg(Color::Yellow)),
+            Span::styled(name, Style::default().fg(Color::White)),
+            Span::styled(
+                " and all messages? [y] confirm  [any] cancel",
+                Style::default().fg(Color::Yellow),
+            ),
+        ]);
+        frame.render_widget(
+            Paragraph::new(line).style(Style::default().bg(Color::Black)),
+            ratatui::layout::Rect {
+                x: 0,
+                y,
+                width: area.width,
+                height: 1,
+            },
+        );
+    }
+
     fn render_main(&mut self, frame: &mut Frame) {
         let area = frame.area();
         let root = Layout::vertical([
@@ -1534,7 +1620,7 @@ impl App {
             Span::styled("TUI", Style::default().fg(Color::White)),
             Span::raw("  "),
             Span::styled(
-                "Tab=switch  ↑↓/jk=nav  i=compose  s=settings  n=add node  q=quit",
+                "Tab=switch  ↑↓/jk=nav  i=compose  s=settings  n=add node  x=remove node  q=quit",
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
