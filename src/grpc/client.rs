@@ -301,7 +301,7 @@ impl KeyUserClient {
                 device_id: device_id.to_string(),
                 pre_keys,
                 signed_pre_key: None,
-                replace_existing: false,
+                replace_existing: true,
                 kyber_pre_keys: vec![],
                 kyber_signed_pre_key: None,
             }))
