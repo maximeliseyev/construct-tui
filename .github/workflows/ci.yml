@@ -16,8 +16,21 @@ jobs:
   lint-and-test:
     name: Lint & Test
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: construct-tui
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout construct-tui
+        uses: actions/checkout@v4
+        with:
+          path: construct-tui
+
+      - name: Checkout construct-core
+        uses: actions/checkout@v4
+        with:
+          repository: maximeliseyev/construct-core
+          token: ${{ secrets.PERSONAL_TOKEN }}
+          path: construct-core
 
       - name: Install Rust (stable + components)
         uses: dtolnay/rust-toolchain@stable
@@ -32,8 +45,8 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            target/
-          key: linux-x64-cargo-${{ hashFiles('**/Cargo.lock') }}
+            construct-tui/target/
+          key: linux-x64-cargo-${{ hashFiles('construct-tui/Cargo.lock') }}
           restore-keys: linux-x64-cargo-
 
       - name: Install system deps (OpenSSL, pkg-config)
@@ -53,8 +66,22 @@ jobs:
     name: Build Linux x86_64
     runs-on: ubuntu-latest
     needs: lint-and-test
+    defaults:
+      run:
+        working-directory: construct-tui
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout construct-tui
+        uses: actions/checkout@v4
+        with:
+          path: construct-tui
+
+      - name: Checkout construct-core
+        uses: actions/checkout@v4
+        with:
+          repository: maximeliseyev/construct-core
+          token: ${{ secrets.PERSONAL_TOKEN }}
+          path: construct-core
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo
@@ -65,8 +92,8 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            target/
-          key: linux-x64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+            construct-tui/target/
+          key: linux-x64-cargo-release-${{ hashFiles('construct-tui/Cargo.lock') }}
           restore-keys: linux-x64-cargo-
 
       - name: Install system deps
@@ -75,8 +102,8 @@ jobs:
       - name: Build release
         run: cargo build --release
 
-      - name: Rename binary
-        run: mv target/release/${{ env.BIN_NAME }} konstrukt-linux-x86_64
+      - name: Package artifact
+        run: mv target/release/${{ env.BIN_NAME }} ../konstrukt-linux-x86_64
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -90,8 +117,21 @@ jobs:
     name: Build Linux aarch64
     runs-on: ubuntu-latest
     needs: lint-and-test
+    defaults:
+      run:
+        working-directory: construct-tui
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout construct-tui
+        uses: actions/checkout@v4
+        with:
+          path: construct-tui
+
+      - name: Checkout construct-core
+        uses: actions/checkout@v4
+        with:
+          repository: maximeliseyev/construct-core
+          token: ${{ secrets.PERSONAL_TOKEN }}
+          path: construct-core
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -105,8 +145,8 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            target/
-          key: linux-aarch64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+            construct-tui/target/
+          key: linux-aarch64-cargo-release-${{ hashFiles('construct-tui/Cargo.lock') }}
           restore-keys: linux-aarch64-cargo-
 
       - name: Install cross-compilation toolchain
@@ -126,8 +166,8 @@ jobs:
           OPENSSL_DIR: /usr/aarch64-linux-gnu
         run: cargo build --release --target aarch64-unknown-linux-gnu
 
-      - name: Rename binary
-        run: mv target/aarch64-unknown-linux-gnu/release/${{ env.BIN_NAME }} konstrukt-linux-aarch64
+      - name: Package artifact
+        run: mv target/aarch64-unknown-linux-gnu/release/${{ env.BIN_NAME }} ../konstrukt-linux-aarch64
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -141,8 +181,22 @@ jobs:
     name: Build macOS arm64
     runs-on: macos-14
     needs: lint-and-test
+    defaults:
+      run:
+        working-directory: construct-tui
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout construct-tui
+        uses: actions/checkout@v4
+        with:
+          path: construct-tui
+
+      - name: Checkout construct-core
+        uses: actions/checkout@v4
+        with:
+          repository: maximeliseyev/construct-core
+          token: ${{ secrets.PERSONAL_TOKEN }}
+          path: construct-core
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo
@@ -153,15 +207,15 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            target/
-          key: macos-arm64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+            construct-tui/target/
+          key: macos-arm64-cargo-release-${{ hashFiles('construct-tui/Cargo.lock') }}
           restore-keys: macos-arm64-cargo-
 
       - name: Build release
         run: cargo build --release
 
-      - name: Rename binary
-        run: mv target/release/${{ env.BIN_NAME }} konstrukt-macos-arm64
+      - name: Package artifact
+        run: mv target/release/${{ env.BIN_NAME }} ../konstrukt-macos-arm64
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -175,8 +229,22 @@ jobs:
     name: Build macOS x86_64
     runs-on: macos-13
     needs: lint-and-test
+    defaults:
+      run:
+        working-directory: construct-tui
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout construct-tui
+        uses: actions/checkout@v4
+        with:
+          path: construct-tui
+
+      - name: Checkout construct-core
+        uses: actions/checkout@v4
+        with:
+          repository: maximeliseyev/construct-core
+          token: ${{ secrets.PERSONAL_TOKEN }}
+          path: construct-core
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo
@@ -187,15 +255,15 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            target/
-          key: macos-x64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+            construct-tui/target/
+          key: macos-x64-cargo-release-${{ hashFiles('construct-tui/Cargo.lock') }}
           restore-keys: macos-x64-cargo-
 
       - name: Build release
         run: cargo build --release
 
-      - name: Rename binary
-        run: mv target/release/${{ env.BIN_NAME }} konstrukt-macos-x86_64
+      - name: Package artifact
+        run: mv target/release/${{ env.BIN_NAME }} ../konstrukt-macos-x86_64
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
