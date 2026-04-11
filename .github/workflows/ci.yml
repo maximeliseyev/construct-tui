@@ -31,6 +31,12 @@ jobs:
           repository: maximeliseyev/construct-core
           path: construct-core
 
+      - name: Checkout construct-ice
+        uses: actions/checkout@v4
+        with:
+          repository: maximeliseyev/construct-ice
+          path: construct-ice
+
       - name: Install Rust (stable + components)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -79,6 +85,12 @@ jobs:
         with:
           repository: maximeliseyev/construct-core
           path: construct-core
+
+      - name: Checkout construct-ice
+        uses: actions/checkout@v4
+        with:
+          repository: maximeliseyev/construct-ice
+          path: construct-ice
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -129,6 +141,12 @@ jobs:
         with:
           repository: maximeliseyev/construct-core
           path: construct-core
+
+      - name: Checkout construct-ice
+        uses: actions/checkout@v4
+        with:
+          repository: maximeliseyev/construct-ice
+          path: construct-ice
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -193,6 +211,12 @@ jobs:
           repository: maximeliseyev/construct-core
           path: construct-core
 
+      - name: Checkout construct-ice
+        uses: actions/checkout@v4
+        with:
+          repository: maximeliseyev/construct-ice
+          path: construct-ice
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo
@@ -239,6 +263,12 @@ jobs:
         with:
           repository: maximeliseyev/construct-core
           path: construct-core
+
+      - name: Checkout construct-ice
+        uses: actions/checkout@v4
+        with:
+          repository: maximeliseyev/construct-ice
+          path: construct-ice
 
       - uses: dtolnay/rust-toolchain@stable
 

@@ -12,14 +12,15 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
+    auth::RegistrationStep,
     bridge::{BridgeEvent, TokenRefreshMsg},
     config::{self, Session, SessionKey, SessionState, TransportConfig},
     event::{Event, EventHandler, is_quit},
     screens::onboarding::OnboardingField,
     screens::{
         ChatListPane, ChatViewPane, ConnectionState, ContactSearchScreen, DeviceLinkScreen,
-        OnboardingScreen, SafetyNumberScreen, SettingsAction, SettingsScreen, StatusBar,
-        UnlockMode, UnlockScreen, chat_list::Contact, contact_search::SearchResult,
+        OnboardingScreen, RegistrationScreen, SafetyNumberScreen, SettingsAction, SettingsScreen,
+        StatusBar, UnlockMode, UnlockScreen, chat_list::Contact, contact_search::SearchResult,
     },
     tui::Tui,
 };
@@ -36,6 +37,8 @@ enum Screen {
     Onboarding,
     /// Device link form — enter link token from another device.
     DeviceLink,
+    /// Registration in progress — animated checklist.
+    Registering,
     /// Auth request in flight — show spinner message.
     Connecting(String),
     /// Auth failed — show error, return to onboarding.
@@ -85,6 +88,10 @@ pub(crate) enum InternalEvent {
     ContactSearchResult(Vec<SearchResult>),
     /// gRPC search failed.
     ContactSearchError(String),
+    /// Registration step completed — advance the checklist.
+    RegistrationStep(RegistrationStep),
+    /// Periodic tick for spinner animation on the registration screen.
+    Tick,
 }
 
 /// Type alias referenced by `orchestrator_task` to send bridge events back to the UI.
@@ -106,6 +113,9 @@ pub struct App {
     onboarding: OnboardingScreen,
     device_link: DeviceLinkScreen,
     unlock_screen: UnlockScreen,
+    registration: RegistrationScreen,
+    /// Handle to the spinner ticker task — present only while Screen::Registering is active.
+    ticker_handle: Option<tokio::task::AbortHandle>,
     /// Derived key material for the active session (zeroized on drop / logout).
     /// `None` in `--no-encrypt` mode or before the user has entered their passphrase.
     session_key: Option<SessionKey>,
@@ -175,6 +185,8 @@ impl App {
             onboarding: OnboardingScreen::new(),
             device_link: DeviceLinkScreen::new(),
             unlock_screen: UnlockScreen::new(UnlockMode::Unlock),
+            registration: RegistrationScreen::new(),
+            ticker_handle: None,
             session_key: None,
             current_session: None,
             pending_session: None,
@@ -298,8 +310,21 @@ impl App {
         } else {
             Some(username)
         };
+
+        // Channel for step-progress events from register_new_device.
+        let (step_tx, mut step_rx) = mpsc::unbounded_channel::<RegistrationStep>();
+
+        // Forward RegistrationStep events to the main internal_tx so handle_internal sees them.
+        let step_fwd_tx = tx.clone();
         tokio::spawn(async move {
-            let msg = match crate::auth::register_new_device(&url, name.as_deref()).await {
+            while let Some(s) = step_rx.recv().await {
+                let _ = step_fwd_tx.send(InternalEvent::RegistrationStep(s));
+            }
+        });
+
+        tokio::spawn(async move {
+            let msg = match crate::auth::register_new_device(&url, name.as_deref(), &step_tx).await
+            {
                 Ok(r) => {
                     let full = r
                         .session
@@ -317,7 +342,33 @@ impl App {
             };
             let _ = tx.send(InternalEvent::Auth(msg));
         });
-        self.screen = Screen::Connecting("Solving proof-of-work, registering device…".into());
+
+        // Reset the registration checklist and start the spinner ticker.
+        self.registration = RegistrationScreen::new();
+        self.start_ticker();
+        self.screen = Screen::Registering;
+    }
+
+    /// Spawn a background task that sends `InternalEvent::Tick` every 80ms.
+    /// Stores an AbortHandle so it can be cancelled when leaving Screen::Registering.
+    fn start_ticker(&mut self) {
+        self.stop_ticker();
+        let tx = self.internal_tx.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
+                if tx.send(InternalEvent::Tick).is_err() {
+                    break;
+                }
+            }
+        });
+        self.ticker_handle = Some(handle.abort_handle());
+    }
+
+    fn stop_ticker(&mut self) {
+        if let Some(h) = self.ticker_handle.take() {
+            h.abort();
+        }
     }
 
     fn start_auth_link(&mut self, token: String) {
@@ -348,7 +399,15 @@ impl App {
     /// Handle a message arriving from a background task via the unified internal channel.
     fn handle_internal(&mut self, event: InternalEvent) {
         match event {
-            InternalEvent::Auth(msg) => self.handle_auth_msg(msg),
+            InternalEvent::Auth(msg) => {
+                // Registration complete — stop spinner before transitioning.
+                if matches!(self.screen, Screen::Registering) {
+                    self.stop_ticker();
+                    // Show all steps as done briefly before AuthMsg is processed.
+                    self.registration.active_step = crate::screens::registration::STEPS.len();
+                }
+                self.handle_auth_msg(msg);
+            }
             InternalEvent::TokenRefresh(msg) => self.handle_token_refresh_msg(msg),
             InternalEvent::Bridge(evt) => self.handle_bridge_event(evt),
             InternalEvent::ContactSearchResult(results) => {
@@ -356,6 +415,14 @@ impl App {
             }
             InternalEvent::ContactSearchError(msg) => {
                 self.contact_search.set_error(msg);
+            }
+            InternalEvent::RegistrationStep(step) => {
+                self.registration.advance(step.index());
+            }
+            InternalEvent::Tick => {
+                if matches!(self.screen, Screen::Registering) {
+                    self.registration.tick();
+                }
             }
         }
     }
@@ -432,9 +499,11 @@ impl App {
                 }
             }
             AuthMsg::Failure(msg) if msg == "no_session" => {
+                self.stop_ticker();
                 self.screen = Screen::Onboarding;
             }
             AuthMsg::Failure(msg) => {
+                self.stop_ticker();
                 // Auto-restore on startup (plaintext path): session_key is None because
                 // no passphrase has been entered yet.  Show Onboarding so the user can
                 // re-register — they likely just logged out or the session file is stale.
@@ -1308,6 +1377,9 @@ impl App {
         }
         if matches!(self.screen, Screen::DeviceLink) {
             return frame.render_widget(&self.device_link, area);
+        }
+        if matches!(self.screen, Screen::Registering) {
+            return frame.render_widget(&self.registration, area);
         }
         if matches!(self.screen, Screen::Unlock | Screen::SetPassphrase) {
             return frame.render_widget(&self.unlock_screen, area);

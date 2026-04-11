@@ -13,11 +13,43 @@ use construct_core::{
     device_id::derive_device_id,
 };
 use ed25519_dalek::Signer;
+use tokio::sync::mpsc;
+use tokio::time::{Duration, sleep};
 
 use crate::{
     config::{Session, load_session, save_session},
     grpc::{ConstructClient, services::DevicePublicKeys},
 };
+
+/// Each step of registration, sent to the UI as it progresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationStep {
+    GeneratingSigningKey,
+    GeneratingIdentityKey,
+    GeneratingPreKey,
+    SigningPreKey,
+    Connecting,
+    SolvingPoW,
+    Registering,
+}
+
+impl RegistrationStep {
+    /// Index corresponding to `screens::registration::STEPS` order.
+    pub fn index(self) -> usize {
+        match self {
+            Self::GeneratingSigningKey => 0,
+            Self::GeneratingIdentityKey => 1,
+            Self::GeneratingPreKey => 2,
+            Self::SigningPreKey => 3,
+            Self::Connecting => 4,
+            Self::SolvingPoW => 5,
+            Self::Registering => 6,
+        }
+    }
+}
+
+/// Minimum time each step stays visible so the user can read it (ms).
+const MIN_STEP_MS: u64 = 500;
 
 /// Result of a successful auth (returned to the UI layer).
 #[derive(Debug, Clone)]
@@ -66,21 +98,39 @@ pub async fn try_restore_session(server_url: &str) -> Result<Option<AuthResult>>
 
 /// Register a brand-new device and save the resulting session.
 /// `username` is optional (display name hint sent to the server).
-pub async fn register_new_device(server_url: &str, username: Option<&str>) -> Result<AuthResult> {
-    // 1. Generate device keys
-    let signing_pair = Ed25519KeyPair::generate();
-    let identity_pair = X25519KeyPair::generate();
-    let spk_pair = X25519KeyPair::generate();
+/// `progress_tx` receives step updates for the UI checklist; send errors are silently ignored.
+pub async fn register_new_device(
+    server_url: &str,
+    username: Option<&str>,
+    progress_tx: &mpsc::UnboundedSender<RegistrationStep>,
+) -> Result<AuthResult> {
+    let step = |s: RegistrationStep| {
+        let _ = progress_tx.send(s);
+    };
 
+    // 1. Generate device keys — each step has a minimum display time
+    step(RegistrationStep::GeneratingSigningKey);
+    let signing_pair = Ed25519KeyPair::generate();
+    sleep(Duration::from_millis(MIN_STEP_MS)).await;
+
+    step(RegistrationStep::GeneratingIdentityKey);
+    let identity_pair = X25519KeyPair::generate();
+    sleep(Duration::from_millis(MIN_STEP_MS)).await;
+
+    step(RegistrationStep::GeneratingPreKey);
+    let spk_pair = X25519KeyPair::generate();
+    sleep(Duration::from_millis(MIN_STEP_MS)).await;
+
+    step(RegistrationStep::SigningPreKey);
     // 2. Derive device_id from identity public key
     let device_id = derive_device_id(&identity_pair.public_key);
-
     // 3. Sign the SPK: prologue || spk_public_key (standard X3DH SPK signing)
     let prologue = build_prologue(SuiteID::CLASSIC);
     let mut spk_msg = prologue;
     spk_msg.extend_from_slice(&spk_pair.public_key);
     let sk = signing_pair.get_signing_key();
     let spk_sig = sk.sign(&spk_msg);
+    sleep(Duration::from_millis(MIN_STEP_MS)).await;
 
     // 4. Build DevicePublicKeys proto message
     let public_keys = DevicePublicKeys {
@@ -91,17 +141,25 @@ pub async fn register_new_device(server_url: &str, username: Option<&str>) -> Re
         crypto_suite: "Curve25519+Ed25519".into(),
     };
 
-    // 5. Connect and register (includes PoW)
+    // 5. Connect to server
+    step(RegistrationStep::Connecting);
     let mut client = ConstructClient::connect(server_url)
         .await
         .context("connecting to server")?;
+    sleep(Duration::from_millis(MIN_STEP_MS)).await;
 
+    // 6. Solve proof-of-work and register (variable duration — no artificial delay)
+    step(RegistrationStep::SolvingPoW);
     let resp = client
         .register(username, &device_id, public_keys)
         .await
         .context("registering new device")?;
 
-    // 6. Build session (caller is responsible for saving — encrypted or plaintext)
+    // 7. Brief "Registering identity" confirmation before transitioning
+    step(RegistrationStep::Registering);
+    sleep(Duration::from_millis(MIN_STEP_MS)).await;
+
+    // 8. Build session (caller is responsible for saving — encrypted or plaintext)
     let session = Session {
         signing_key_hex: hex::encode(*signing_pair.private_key),
         identity_key_hex: hex::encode(*identity_pair.private_key),
