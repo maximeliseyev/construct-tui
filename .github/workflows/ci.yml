@@ -54,8 +54,8 @@ jobs:
           key: linux-x64-cargo-${{ hashFiles('construct-tui/Cargo.lock') }}
           restore-keys: linux-x64-cargo-
 
-      - name: Install system deps (OpenSSL, pkg-config)
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - name: Install system deps (OpenSSL, pkg-config, protoc)
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev protobuf-compiler
 
       - name: cargo fmt check
         run: cargo fmt -- --check
@@ -107,7 +107,7 @@ jobs:
           restore-keys: linux-x64-cargo-
 
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev protobuf-compiler
 
       - name: Build release
         run: cargo build --release
@@ -171,8 +171,9 @@ jobs:
             gcc-aarch64-linux-gnu \
             pkg-config \
             libssl-dev:arm64 \
+            protobuf-compiler \
             --no-install-recommends || \
-          sudo apt-get install -y gcc-aarch64-linux-gnu pkg-config
+          sudo apt-get install -y gcc-aarch64-linux-gnu pkg-config protobuf-compiler
 
       - name: Build release (cross)
         env:
@@ -231,6 +232,9 @@ jobs:
           key: macos-arm64-cargo-release-${{ hashFiles('construct-tui/Cargo.lock') }}
           restore-keys: macos-arm64-cargo-
 
+      - name: Install protoc (macOS)
+        run: brew install protobuf
+
       - name: Build release
         run: cargo build --release
 
@@ -283,6 +287,9 @@ jobs:
             construct-tui/target/
           key: macos-x64-cargo-release-${{ hashFiles('construct-tui/Cargo.lock') }}
           restore-keys: macos-x64-cargo-
+
+      - name: Install protoc (macOS)
+        run: brew install protobuf
 
       - name: Build release
         run: cargo build --release
