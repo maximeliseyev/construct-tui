@@ -16,18 +16,9 @@ pub const STEPS: &[&str] = &[
     "Registering identity",
 ];
 
-/// "Chaos → Order" animation: scattered dots gradually converge into a solid line.
-/// Each frame is exactly 3 display columns (placed inside [ ] brackets in the render).
-const SPINNER: &[&str] = &[
-    "∙ ∙", // scattered
-    " ∙ ", // centre
-    "∙∙ ", // drifting left
-    " ∙∙", // drifting right
-    "·∙·", // three uneven
-    "·→·", // converging inward
-    "·──", // line forming
-    "───", // ORDER achieved
-];
+/// Simple blink: alternates between a visible dot and empty every ~400ms.
+/// The 80ms ticker calls tick() on each frame; 5 ticks ≈ 400ms per state.
+const SPINNER: &[&str] = &["·", "·", "·", "·", "·", " ", " ", " ", " ", " "];
 
 pub struct RegistrationScreen {
     /// How many steps have been *started* (index of the currently active step).
@@ -86,20 +77,20 @@ impl Widget for &RegistrationScreen {
         y += 2;
 
         // ── Step list ─────────────────────────────────────────────────────────
-        // All prefixes are 5 display cols: [xxx] where xxx is 3 chars.
+        // All prefixes are 3 display cols: [x] where x is 1 char.
         let label_max = STEPS.iter().map(|s| s.chars().count()).max().unwrap_or(0) as u16;
-        let row_w = 7 + label_max; // "[xxx] " (6) + 1 space margin
+        let row_w = 5 + label_max; // "[x] " (4) + 1 space margin
         let row_x = area.x + area.width.saturating_sub(row_w) / 2;
 
         for (i, label) in STEPS.iter().enumerate() {
             let frame = SPINNER[(self.spinner_tick as usize) % SPINNER.len()];
             let (prefix, prefix_color, label_color): (String, Color, Color) =
                 if i < self.active_step {
-                    ("[ ✓ ]".into(), Color::Green, Color::DarkGray)
+                    ("[✓]".into(), Color::Green, Color::DarkGray)
                 } else if i == self.active_step {
                     (format!("[{frame}]"), Color::Cyan, Color::White)
                 } else {
-                    ("[   ]".into(), Color::DarkGray, Color::DarkGray)
+                    ("[ ]".into(), Color::DarkGray, Color::DarkGray)
                 };
 
             let line = Line::from(vec![
