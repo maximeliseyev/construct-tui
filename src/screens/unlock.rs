@@ -138,7 +138,8 @@ impl Widget for &UnlockScreen {
         // ── Passphrase field (masked) ─────────────────────────────────────────
         let field_w = 42u16.min(area.width.saturating_sub(4));
         let field_x = area.x + area.width.saturating_sub(field_w) / 2;
-        let masked = format!("{}•", "•".repeat(self.passphrase.len()));
+        // Mask typed chars with bullets; show underscore cursor only at end
+        let masked = format!("{}_", "•".repeat(self.passphrase.len()));
 
         Paragraph::new(masked)
             .block(
