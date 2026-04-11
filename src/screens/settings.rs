@@ -8,6 +8,8 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, StatefulWidget, Widget},
 };
 
+use super::qr_widget::QrWidget;
+
 /// An action the user triggered from the settings screen.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SettingsAction {
@@ -17,6 +19,8 @@ pub enum SettingsAction {
     ShowSafetyNumber,
     /// User pressed [E] — export identity keys.
     ExportKeys,
+    /// User pressed [Q] — show own identity QR (narrow terminals only).
+    ShowMyQr,
     /// User pressed Esc or [B] — go back.
     Back,
 }
@@ -173,8 +177,22 @@ impl Widget for &mut SettingsScreen {
         let inner = outer.inner(area);
         outer.render(area, buf);
 
+        // On wide terminals (≥ 100 cols) split: settings list | identity QR
+        if area.width >= 100 {
+            let cols =
+                Layout::horizontal([Constraint::Min(50), Constraint::Length(36)]).split(inner);
+            self.render_list(cols[0], buf);
+            self.render_identity_qr(cols[1], buf);
+        } else {
+            self.render_list(inner, buf);
+        }
+    }
+}
+
+impl SettingsScreen {
+    fn render_list(&mut self, area: Rect, buf: &mut Buffer) {
         // Header hint
-        let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
+        let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
         let hint = Paragraph::new(Line::from(Span::styled(
             "  ↑↓ navigate  Enter=select  Esc=back",
             Style::default().fg(Color::DarkGray),
@@ -225,5 +243,20 @@ impl Widget for &mut SettingsScreen {
         let mut state = self.state;
         StatefulWidget::render(list, chunks[1], buf, &mut state);
         self.state = state;
+    }
+
+    fn render_identity_qr(&self, area: Rect, buf: &mut Buffer) {
+        let block = Block::default()
+            .title(" My Identity ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray));
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        // Encode user handle so contacts can add by scanning
+        let qr_data = format!("construct:add:{}", self.user_id);
+        QrWidget::new(&qr_data)
+            .caption(&self.user_id)
+            .render(inner, buf);
     }
 }

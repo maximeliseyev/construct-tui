@@ -1069,6 +1069,11 @@ impl App {
                         SettingsAction::ExportKeys => {
                             self.export_identity_key();
                         }
+                        SettingsAction::ShowMyQr => {
+                            // QR is always visible in wide-terminal right panel;
+                            // on narrow terminals this action would open a dedicated view.
+                            // For now: no-op (the QR panel auto-shows at width ≥ 100).
+                        }
                     }
                 }
             }

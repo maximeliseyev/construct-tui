@@ -4,6 +4,7 @@ pub mod connection_status;
 pub mod contact_search;
 pub mod device_link;
 pub mod onboarding;
+pub mod qr_widget;
 pub mod safety_number;
 pub mod settings;
 pub mod unlock;
