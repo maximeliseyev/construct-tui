@@ -10,7 +10,6 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, StatefulWidget, Widget},
 };
 
-use super::qr_widget::QrWidget;
 use crate::invite::generate_invite_qr;
 
 /// An action the user triggered from the settings screen.
@@ -105,6 +104,11 @@ impl SettingsScreen {
             },
             // Actions
             SettingsItem {
+                label: "[Q] My QR code".into(),
+                value: String::new(),
+                action: Some(SettingsAction::ShowMyQr),
+            },
+            SettingsItem {
                 label: "[S] Safety number".into(),
                 value: String::new(),
                 action: Some(SettingsAction::ShowSafetyNumber),
@@ -127,7 +131,7 @@ impl SettingsScreen {
         ];
 
         let mut state = ListState::default();
-        // Start selection on first action row.
+        // Start selection on first action row (now index 6 = [Q] My QR).
         state.select(Some(6));
 
         Self {
@@ -187,7 +191,7 @@ impl SettingsScreen {
     }
 
     /// Returns a valid invite QR payload, regenerating if the cached one is ≥4 min old.
-    fn invite_payload(&mut self) -> Option<&str> {
+    pub fn invite_payload(&mut self) -> Option<&str> {
         const REFRESH_SECS: u64 = 240; // regenerate after 4 min (TTL is 5 min)
 
         let needs_refresh = match &self.invite_cache {
@@ -297,19 +301,26 @@ impl SettingsScreen {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        match self.invite_payload() {
-            Some(payload) => {
-                // Clone to avoid borrow conflict (payload borrows self, QrWidget needs &str)
-                let payload = payload.to_owned();
-                QrWidget::new(&payload)
-                    .caption(&self.user_id)
-                    .render(inner, buf);
-            }
-            None => {
-                Paragraph::new("Generating invite…")
-                    .style(Style::default().fg(Color::DarkGray))
-                    .render(inner, buf);
-            }
-        }
+        // Pre-generate the invite so [Q] launches instantly.
+        let _ = self.invite_payload();
+
+        let hint = vec![
+            Line::from(Span::styled(
+                &self.user_id,
+                Style::default().fg(Color::White),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Press [Q] to show",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "scannable QR code",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        Paragraph::new(hint)
+            .style(Style::default())
+            .render(inner, buf);
     }
 }

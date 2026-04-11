@@ -3,10 +3,10 @@ use base64::Engine as _;
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout},
-    style::{Color, Style},
+    layout::{Alignment, Constraint, Layout, Rect},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Block, Clear, Paragraph},
 };
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -21,6 +21,7 @@ use crate::{
         ChatListPane, ChatViewPane, ConnectionState, ContactSearchScreen, DeviceLinkScreen,
         OnboardingScreen, RegistrationScreen, SafetyNumberScreen, SettingsAction, SettingsScreen,
         StatusBar, UnlockMode, UnlockScreen, chat_list::Contact, contact_search::SearchResult,
+        qr_widget::QrWidget,
     },
     tui::Tui,
 };
@@ -47,6 +48,8 @@ enum Screen {
     Main,
     /// Settings (server, transport, device ID, logout, safety number…).
     Settings,
+    /// Full-screen identity QR code (any key to dismiss).
+    IdentityQr,
     /// Add-contact search overlay.
     ContactSearch,
     /// Safety number verification for the currently selected contact.
@@ -888,6 +891,10 @@ impl App {
             // Any key exits safety number back to settings.
             self.screen = Screen::Settings;
         }
+        if matches!(self.screen, Screen::IdentityQr) {
+            // Any key exits full-screen QR back to settings.
+            self.screen = Screen::Settings;
+        }
     }
 
     fn handle_onboarding(&mut self, key: crossterm::event::KeyEvent) {
@@ -1160,15 +1167,16 @@ impl App {
                             self.export_identity_key();
                         }
                         SettingsAction::ShowMyQr => {
-                            // QR is always visible in wide-terminal right panel;
-                            // on narrow terminals this action would open a dedicated view.
-                            // For now: no-op (the QR panel auto-shows at width ≥ 100).
+                            self.screen = Screen::IdentityQr;
                         }
                     }
                 }
             }
             // Shortcut keys
             KeyCode::Char('l') | KeyCode::Char('L') => self.do_logout(),
+            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                self.screen = Screen::IdentityQr;
+            }
             KeyCode::Char('s') | KeyCode::Char('S') => {
                 self.open_safety_number_screen();
             }
@@ -1378,6 +1386,11 @@ impl App {
             self.screen = Screen::Settings;
             return frame.render_widget(&mut self.settings_screen, area);
         }
+        if matches!(self.screen, Screen::IdentityQr) {
+            let payload = self.settings_screen.invite_payload().map(|s| s.to_owned());
+            let user_id = self.user_id.clone();
+            return self.render_identity_qr_fullscreen(frame, area, payload.as_deref(), &user_id);
+        }
         if matches!(self.screen, Screen::DeviceLink) {
             return frame.render_widget(&self.device_link, area);
         }
@@ -1403,6 +1416,74 @@ impl App {
         }
         // Screen::Onboarding (and any future unauthenticated screens)
         frame.render_widget(&self.onboarding, area);
+    }
+
+    fn render_identity_qr_fullscreen(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        payload: Option<&str>,
+        user_id: &str,
+    ) {
+        // Dark background
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Block::default().style(Style::default().bg(Color::Black)),
+            area,
+        );
+
+        let Some(payload) = payload else {
+            let msg = Paragraph::new("Generating invite…")
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Center);
+            frame.render_widget(msg, area);
+            return;
+        };
+
+        // Hint at bottom
+        let hint = Paragraph::new(Line::from(vec![
+            Span::styled(
+                "  Scan with Construct iOS to add as node  ",
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                "[ any key to return ]",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            ),
+        ]))
+        .alignment(Alignment::Center);
+
+        let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+        frame.render_widget(hint, chunks[1]);
+
+        // Centre the QR within the available area
+        let qr_area = chunks[0];
+        let Some((qr_w, qr_h)) = QrWidget::size_hint(payload) else {
+            let msg = Paragraph::new("[ QR unavailable — payload too large ]")
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Center);
+            frame.render_widget(msg, qr_area);
+            return;
+        };
+
+        let x = qr_area.x + qr_area.width.saturating_sub(qr_w) / 2;
+        let y = qr_area.y + qr_area.height.saturating_sub(qr_h) / 2;
+        let render_area = Rect {
+            x,
+            y,
+            width: qr_w.min(qr_area.width),
+            height: qr_h.min(qr_area.height),
+        };
+
+        let widget = QrWidget {
+            data: payload,
+            caption: Some(user_id),
+            fg: Color::Black,
+            bg: Color::White,
+        };
+        frame.render_widget(&widget, render_area);
     }
 
     fn render_spinner(&self, frame: &mut Frame, msg: &str) {
