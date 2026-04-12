@@ -780,9 +780,41 @@ impl App {
                 }
             }
             TokenRefreshMsg::Failed(e) => {
-                self.status = format!("Token refresh failed: {e}");
+                tracing::warn!("Token refresh failed ({e}) — attempting device re-auth");
+                self.start_device_reauth();
             }
         }
+    }
+
+    /// Fall back to device signing-key authentication when the refresh token is expired
+    /// or server-rejected (e.g. JWT secret rotation on redeploy).
+    /// On success, routes through the normal `AuthMsg::Success` path which updates tokens,
+    /// persists the session, and restarts the orchestrator with a fresh access token.
+    fn start_device_reauth(&mut self) {
+        let Some(session) = self.current_session.clone() else {
+            self.status = "Device re-auth failed: no session in memory".into();
+            return;
+        };
+        let tx = self.internal_tx.clone();
+        let server_url = self.server_url.clone();
+        tokio::spawn(async move {
+            let msg = match crate::auth::authenticate_saved_session(session, &server_url).await {
+                Ok(result) => {
+                    let full = result
+                        .session
+                        .expect("authenticate_saved_session always returns session");
+                    AuthMsg::Success(Box::new(AuthSuccess {
+                        user_id: result.user_id,
+                        device_id: result.device_id,
+                        access_token: result.access_token,
+                        full_session: full.clone(),
+                        pending_save: Some(full),
+                    }))
+                }
+                Err(e) => AuthMsg::Failure(format!("Device re-auth failed: {e}")),
+            };
+            let _ = tx.send(InternalEvent::Auth(msg));
+        });
     }
 
     fn handle_bridge_event(&mut self, evt: BridgeEvent) {
