@@ -23,7 +23,7 @@ Built with Rust + [Ratatui](https://ratatui.rs). Runs anywhere: Linux, macOS, Ra
 ### Pre-built binary (fastest)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_ORG/construct-tui/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/maximeliseyev/construct-tui/main/scripts/install.sh | sh
 ```
 
 Downloads the latest release for your platform (macOS arm64/x86_64, Linux x86_64/aarch64)
@@ -40,7 +40,7 @@ and installs `konstrukt` to `/usr/local/bin`.
 
 ```bash
 # Example — macOS Apple Silicon
-curl -LO https://github.com/YOUR_ORG/construct-tui/releases/latest/download/konstrukt-macos-arm64.tar.gz
+curl -LO https://github.com/maximeliseyev/construct-tui/releases/latest/download/konstrukt-macos-arm64.tar.gz
 tar xzf konstrukt-macos-arm64.tar.gz
 chmod +x konstrukt-macos-arm64
 mv konstrukt-macos-arm64 /usr/local/bin/konstrukt
