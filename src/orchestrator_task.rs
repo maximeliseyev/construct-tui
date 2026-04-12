@@ -229,16 +229,118 @@ async fn dispatch(
 
         // ── Session healing ─────────────────────────────────────────────────
         Action::SessionHealNeeded { contact_id, role } => {
-            tracing::warn!(
+            tracing::info!(
                 target: "orchestrator_task",
                 contact_id = %contact_id,
                 role = %role,
-                "Session heal needed — re-queuing as END_SESSION recovery"
+                "Session heal needed — attempting recovery"
             );
-            // Simple recovery: request a fresh session init by feeding AppLaunched
-            // which will trigger a prewarm sweep. More sophisticated healing can
-            // be added later.
-            let _ = self_tx.send(IncomingEvent::AppLaunched);
+
+            if role == "Initiator" {
+                // ── TUI wins the tie-break (higher userId) ──────────────────
+                // Notify the peer to reset its conflicting INITIATOR session,
+                // then re-initialize our own session with fresh ephemeral keys.
+                // After re-init the session ping (msgNum=0) will let the peer
+                // establish itself as RESPONDER.
+                let end_sess = build_control_envelope(
+                    my_user_id,
+                    my_device_id,
+                    &contact_id,
+                    ContentType::SessionReset,
+                    vec![],
+                    uuid_v4(),
+                );
+                let _ = stream_tx.try_send(StreamCmd::Send(Box::new(end_sess)));
+
+                // Re-fetch bundle and re-init INITIATOR session.
+                match fetch_bundle_json(grpc_url, access_token, my_user_id, &contact_id).await {
+                    Ok(bundle_json) => {
+                        let _ = orchestrator
+                            .init_session_with_bundle(&contact_id, bundle_json.as_bytes());
+                        follow_ups.push(IncomingEvent::SessionInitCompleted {
+                            contact_id: contact_id.clone(),
+                            session_data: vec![],
+                        });
+                        // Send a session ping so the peer can init as RESPONDER
+                        // without waiting for the user to type a message.
+                        follow_ups.push(IncomingEvent::OutgoingMessage {
+                            contact_id: contact_id.clone(),
+                            message_id: uuid_v4(),
+                            plaintext_utf8: "\x00PING\x00".into(),
+                            content_type: 0,
+                        });
+                    }
+                    Err(e) => tracing::error!(
+                        target: "orchestrator_task",
+                        contact_id = %contact_id,
+                        error = %e,
+                        "Heal (Initiator): bundle fetch failed"
+                    ),
+                }
+            } else {
+                // ── TUI loses the tie-break (lower userId = Responder) ───────
+                // The peer's msgNum=0 is queued in the Rust healing_queue.
+                // Fetch the peer's bundle and initialize the RESPONDER session
+                // using the queued wire payload.
+                let wire_payload = orchestrator.take_heal_payload(&contact_id);
+                match wire_payload {
+                    None => tracing::error!(
+                        target: "orchestrator_task",
+                        contact_id = %contact_id,
+                        "Heal (Responder): no queued wire payload — cannot heal"
+                    ),
+                    Some(wire) => {
+                        match fetch_bundle_json(grpc_url, access_token, my_user_id, &contact_id)
+                            .await
+                        {
+                            Ok(bundle_json) => {
+                                match orchestrator.init_receiving_session_with_msg(
+                                    &contact_id,
+                                    bundle_json.as_bytes(),
+                                    &wire,
+                                ) {
+                                    Ok(_) => {
+                                        tracing::info!(
+                                            target: "orchestrator_task",
+                                            contact_id = %contact_id,
+                                            "Heal (Responder): session established"
+                                        );
+                                        follow_ups.push(IncomingEvent::SessionInitCompleted {
+                                            contact_id: contact_id.clone(),
+                                            session_data: vec![],
+                                        });
+                                    }
+                                    Err(e) => {
+                                        // Crypto failed — notify peer to start fresh.
+                                        tracing::warn!(
+                                            target: "orchestrator_task",
+                                            contact_id = %contact_id,
+                                            error = %e,
+                                            "Heal (Responder): init_receiving_session failed — sending END_SESSION"
+                                        );
+                                        let end_sess = build_control_envelope(
+                                            my_user_id,
+                                            my_device_id,
+                                            &contact_id,
+                                            ContentType::SessionReset,
+                                            vec![],
+                                            uuid_v4(),
+                                        );
+                                        let _ =
+                                            stream_tx.try_send(StreamCmd::Send(Box::new(end_sess)));
+                                    }
+                                }
+                            }
+                            Err(e) => tracing::error!(
+                                target: "orchestrator_task",
+                                contact_id = %contact_id,
+                                error = %e,
+                                "Heal (Responder): bundle fetch failed"
+                            ),
+                        }
+                    }
+                }
+            }
         }
 
         Action::HealSuppressed {
