@@ -175,11 +175,48 @@ async fn dispatch(
             contact_id,
             bundle_json,
         } => {
-            // Call into orchestrator directly (it owns ClassicClient).
-            // On success, session is already inside the orchestrator.
-            let _ = orchestrator.init_session_with_bundle(&contact_id, bundle_json.as_bytes());
-            // Feed SessionInitCompleted back — empty session_data means
-            // the orchestrator already imported the session internally.
+            // Detect RESPONDER case: the peer already sent us their X3DH first message
+            // (msgNum=0) which is queued in the orchestrator's pending queue.
+            // In that case we must init as RESPONDER (not INITIATOR) using their
+            // wire payload so that the X3DH shared secret matches on both sides.
+            if orchestrator.pending_message_count(&contact_id) > 0 {
+                // RESPONDER path — take the first pending wire payload.
+                if let Some(wire) = orchestrator.peek_first_pending_wire_payload(&contact_id) {
+                    match orchestrator.init_receiving_session_from_wire_payload(
+                        &contact_id,
+                        bundle_json.as_bytes(),
+                        &wire,
+                    ) {
+                        Ok(_) => {
+                            tracing::info!(
+                                target: "orchestrator_task",
+                                contact_id = %contact_id,
+                                "InitSession (Responder): session established from wire payload"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                target: "orchestrator_task",
+                                contact_id = %contact_id,
+                                error = %e,
+                                "InitSession (Responder): init_receiving_session failed"
+                            );
+                            return;
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        target: "orchestrator_task",
+                        contact_id = %contact_id,
+                        "InitSession (Responder): pending_count>0 but no wire payload — falling back to Initiator"
+                    );
+                    let _ =
+                        orchestrator.init_session_with_bundle(&contact_id, bundle_json.as_bytes());
+                }
+            } else {
+                // INITIATOR path — no pending messages, we are starting fresh.
+                let _ = orchestrator.init_session_with_bundle(&contact_id, bundle_json.as_bytes());
+            }
             follow_ups.push(IncomingEvent::SessionInitCompleted {
                 contact_id,
                 session_data: vec![],
@@ -247,7 +284,7 @@ async fn dispatch(
                     my_device_id,
                     &contact_id,
                     ContentType::SessionReset,
-                    vec![],
+                    vec![0u8; 16],
                     uuid_v4(),
                 );
                 let _ = stream_tx.try_send(StreamCmd::Send(Box::new(end_sess)));
@@ -294,7 +331,7 @@ async fn dispatch(
                             .await
                         {
                             Ok(bundle_json) => {
-                                match orchestrator.init_receiving_session_with_msg(
+                                match orchestrator.init_receiving_session_from_wire_payload(
                                     &contact_id,
                                     bundle_json.as_bytes(),
                                     &wire,
@@ -323,7 +360,7 @@ async fn dispatch(
                                             my_device_id,
                                             &contact_id,
                                             ContentType::SessionReset,
-                                            vec![],
+                                            vec![0u8; 16],
                                             uuid_v4(),
                                         );
                                         let _ =
@@ -555,7 +592,16 @@ fn build_envelope(
         content_type: content_type as i32,
         message_id_type: Some(MessageIdType::MessageId(message_id)),
         encrypted_payload: payload,
-        conversation_id: format!("direct:{}:{}", from_user, to_user),
+        conversation_id: {
+            // Must match iOS ConversationId.direct() — sort user IDs lexicographically
+            // so both sides produce the same key regardless of message direction.
+            let (a, b) = if from_user < to_user {
+                (from_user, to_user)
+            } else {
+                (to_user, from_user)
+            };
+            format!("direct:{}:{}", a, b)
+        },
         ..Default::default()
     }
 }
