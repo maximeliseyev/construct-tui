@@ -1,124 +1,158 @@
 # AGENTS.md — construct-tui
 
-Context for AI agents working in this repository.
+Hard invariants for AI coding agents in this repository, and nothing else. Every rule here is
+attached to the incident that produced it. Detail lives in the linked documents; read the one
+covering your area **before** working in it.
+
+| Area | Read first |
+|---|---|
+| Forward plan, current gaps | `~/Code/construct-docs/client/TUI_DEVELOPMENT_GUIDE.md` |
+| Why gRPC is in-tree | `~/Code/construct-docs/decisions/tui-in-tree-grpc.md` |
+| Protocol behaviour (source of truth) | `construct-messenger` + `~/Code/construct-docs/client/ios/ARCHITECTURE_NOTES.md` |
+| Session / identity / AD | `~/Code/construct-docs/decisions/identity-spaces.md` |
+| Handshake vs leftover | `~/Code/construct-docs/decisions/message-number-zero-is-not-a-handshake.md` |
+| Stream cursor / reconnect | `~/Code/construct-docs/decisions/stream-cursor-stall-anatomy.md` |
+| Binary data / CFE | `~/Code/construct-docs/client/shared/construct-ffi-binary-format.md` |
+| Product wording | `~/Code/construct-docs/client/GLOSSARY_PRODUCT_LANGUAGE.md` |
+| Protos | sibling `construct-protos`; `~/Code/construct-docs/decisions/protos-are-vendored-not-copied.md` |
+| Engine is dead | `~/Code/construct-docs/decisions/macos-desktop-strategy.md` |
+| Everything else | `~/Code/construct-docs` (vault; its own `AGENTS.md` is authoritative) |
 
 ---
 
-## What is construct-tui?
+## Overview
 
-Terminal UI client for Construct Messenger. Built with Rust + [Ratatui](https://ratatui.rs).
-Runs on macOS, Linux, Raspberry Pi. Binary name: `konstruct`.
+Terminal UI client for Konstruct. Rust + Ratatui. Binary `konstruct`. Crate, git repo, and
+config directory stay `construct-tui` — that split is deliberate (hygiene 2026-08-22: an
+accidental binary rename fought the user-facing name; config was wrongly advertised as
+`~/.config/konstruct/`).
 
-**This client is behind iOS and is not currently a production-usable messenger.**
-`construct-messenger` is the source of truth for how the protocol actually works.
-Do not treat the April 2026 TUI guide as current — it lives in
-`construct-docs/_archive/TUI_DEVELOPMENT_GUIDE.md`.
+This client is behind iOS and is **not** a production-usable messenger. Protocol behaviour
+comes from `construct-messenger`, not from this tree or from the April 2026 TUI guide
+(`construct-docs/_archive/TUI_DEVELOPMENT_GUIDE.md`).
 
----
-
-## Current stack (read before changing anything)
-
-```
-screens/  →  app.rs
-              ├── orchestrator_task.rs  →  construct-core Orchestrator
-              └── grpc/                 →  gRPC-over-H3 (ported from construct-engine)
-                    ├── client.rs       connection + unary
-                    ├── stream.rs       MessageStream bidi
-                    └── auth/keys/users typed RPCs
-```
-
-- Crypto stays in `construct-core::orchestration::Orchestrator`.
-- Network I/O stays in `src/grpc/`. Screens and `app.rs` must not import `h3`/`quinn`.
-- `src/grpc/` is written to be liftable into a shared desktop crate later. Do not
-  smear it into widgets.
-- `--bridge` / `--headless` / `--config` are clap flags, not behaviour.
-
-Toolchain: stable ≥ 1.96. `Cargo.lock` must be regenerated after the engine drop.
+Sibling checkouts under `~/Code/`: `construct-core` (path dep), `construct-protos` (prost
+source of truth). GitHub org: [konstruct-msg](https://github.com/konstruct-msg).
 
 ---
 
-## Architecture
+## Build
 
-```
-main.rs
-├── app.rs               — App state, event loop
-├── orchestrator_task.rs — construct-core Orchestrator actor (preferred crypto path)
-├── bridge.rs            — PlatformBridge + UI events from the orchestrator
-├── grpc/                — gRPC-over-H3 client (extractable later)
-├── proto.rs             — prost types from construct-protos
-├── streaming.rs         — MessageStream worker (uses grpc/)
-├── storage.rs           — SQLCipher messages / sessions / acks
-├── auth.rs              — registration / restore (gRPC via `grpc/`)
-├── invite.rs            — invite link handling
-├── tui.rs               — terminal setup / teardown
-├── event.rs             — TUI input event types
-├── config/              — ~/.config/construct-tui/  (session.enc, config.json)
-└── screens/             — Ratatui widgets (chats, chat, settings, login, register…)
-```
-
-Screens borrow from `App`. They must not call `construct-core` internals or
-`h3`/`quinn`. Crypto goes through `orchestrator_task`; network I/O through `grpc/`.
-
----
-
-## Build & Run
-
-GitHub org: [konstruct-msg](https://github.com/konstruct-msg). Local siblings under `~/Code/`:
-
-| Checkout | GitHub | Role |
-|---|---|---|
-| `../construct-core` | [construct-core](https://github.com/konstruct-msg/construct-core) | crypto / Orchestrator (path dep) |
-| `../construct-protos` | | protobuf source of truth |
-| `../construct-veil` | [construct-veil](https://github.com/konstruct-msg/construct-veil) | DPI / obfs4 successor — not wired in TUI yet |
-
-This repo: [construct-tui](https://github.com/konstruct-msg/construct-tui).
-
-Toolchain: stable ≥ 1.96.
+Toolchain: stable **1.96** (`rust-toolchain.toml`). Core's `rust-version` is 1.96; a 1.92
+host failed the first compile after the engine drop with an error that looked like a crate
+problem.
 
 ```bash
 cargo build --release              # binary at target/release/konstruct
-cargo run                          # dev mode
-cargo test                         # tests (storage + safety number only)
+cargo run
+cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```
 
-Cross-compilation (when the crate actually builds):
+Default features include `post-quantum`. There is **no** `ice` feature. `construct-ice` is
+gone; do not add a `[patch]` for it — a gitignored `.cargo/config.toml` pointing at
+`../construct-ice` is what made `cargo check --offline` fail on a repo that no longer
+exists.
 
-```bash
-cargo build --release --target x86_64-unknown-linux-gnu
-cargo build --release --target aarch64-unknown-linux-gnu
-```
-
-Default features include `post-quantum`. There is **no** `ice` feature.
+Do not copy `.proto` files into this repo. `build.rs` reads `CONSTRUCT_PROTOS_DIR`, default
+`../construct-protos`.
 
 ---
 
-## Key conventions
+## Architecture invariants
 
-- New protocol work follows iOS/`construct-core`, not the engine.
-- TUI screens are in `screens/` — Ratatui `Widget` impls.
-- State lives in `app.rs` `App` — screens borrow from it.
-- User config: `~/.config/construct-tui/` (not `~/.config/konstruct/`).
-- Data: `~/.local/share/construct-tui/` (`messages.db`, `konstruct.log`).
+```
+screens/  →  app.rs
+              ├── orchestrator_task.rs  →  construct-core Orchestrator
+              └── grpc/                 →  gRPC-over-H3 (system-root TLS)
+```
+
+- **`construct-engine` does not come back.** Retired from messenger 2026-07-28, dropped from
+  this crate 2026-08-22. No `EngineAdapter`, no `UiEvent`/`PlatformAction` façade. See
+  `decisions/macos-desktop-strategy.md` — the 2026-06-16 trigger "engine returns if a TUI
+  push starts" is retired; the TUI push started and still does not use the engine.
+- **Do not depend on `construct-transport`.** That crate is the iOS UniFFI pipe and
+  `QuicClient::connect` wants a **pinned gateway cert**. The TUI talks to a public hostname
+  with the platform trust store. Growing transport to serve both products in one session is
+  how two clients get coupled. Code lives in `src/grpc/` until a second non-Apple client
+  exists; then lift the directory. Decision: `decisions/tui-in-tree-grpc.md`.
+- **Screens and `app.rs` do not import `h3` / `quinn` / `construct-core` internals.** Crypto
+  goes through `orchestrator_task`; network I/O through `grpc/`. `src/grpc/` has no Ratatui
+  types and no `App` types — that is the extract boundary.
+- **INITIATOR and RESPONDER init paths are distinct** (`init_session` vs
+  `init_receiving_session`); tie-break: higher deviceId wins as INITIATOR. Copying the iOS
+  "one init path" shortcut produces a permanent AEAD failure against a phone.
+- **Session addressing uses `ServerUserId` (36-char UUID), never `CryptoDeviceId` (32-char
+  hex).** Mixing the spaces breaks Double Ratchet AD.
+- **`messageNumber == 0` is not a handshake.** A sending-chain restart looks the same as
+  X3DH. Treating zero as "new session" is how leftovers loop on every reconnect.
+- **Device keys are deleted only on gRPC UNAUTHENTICATED (16) / PERMISSION_DENIED (7)** —
+  never on a transport error.
+- **Advance `since_cursor` only after durable persist.** The server trims to that value.
+  Optimistic advance deletes mail. The server also currently rewinds on the initial poll
+  (`backend/MESSAGING_INITIAL_POLL_IGNORES_SINCE_CURSOR.md`); reconnect must tolerate
+  redelivery.
+- **A producer with no consumer is a defect.** If you add a send, a signal, or an action,
+  the reader lands in the same change — or the sender is removed. An unconsumed control
+  message still costs a ratchet advance (`__session_reset_notify__`, April 2026, four months
+  of visible bubbles on multi-device accounts).
+- **VEIL is not ICE and is not wired.** `--bridge` / `--headless` / `--config` are clap
+  flags, not behaviour. Do not resume obfs4 / `construct-ice`. VEIL is phase D of the TUI
+  plan, after 1:1 text works.
+
+---
+
+## Binary data
+
+Same pipeline as iOS. Keys, ciphertexts, and wire payloads are bytes end to end — protobuf
+`bytes` or CFE. No base64 in message processing, session management, or storage. Base64 only
+at true text-transport boundaries (QR, invite links). Session state that the Orchestrator
+asks to persist comes from `export_session_bytes_for`, not JSON.
+
+---
+
+## Code conventions
+
+- TUI screens are Ratatui `Widget` impls in `screens/`. State lives in `App`; screens borrow
+  it.
+- User-facing copy is plain language ("people / chats / device", never "node / stream /
+  replica"). Product name **Konstruct** in Latin. Code identifiers keep domain names.
+- Config: `~/.config/construct-tui/` (`session.enc`, `config.json`). Data:
+  `~/.local/share/construct-tui/` (`messages.db`, `konstruct.log`). Argon2id is 32 MiB.
+- Comment only non-obvious logic. A field left out on purpose at a boundary must say so in
+  a comment — an uncommented omission is indistinguishable from a forgotten one.
+- [Conventional Commits](https://www.conventionalcommits.org/): `feat(scope): …`,
+  `fix(scope): …`, `refactor(scope): …`, `chore(scope): …`.
+
+---
+
+## Testing
+
+**The target is not a coverage number.** A test that cannot fail is worse than no test —
+it occupies the place where someone would otherwise have looked. Extract the decision
+(identity space, handshake-vs-leftover, cursor prefix) and mutate it; do not assert that a
+procedure returned. Method: `~/Code/construct-docs/decisions/testing-by-pure-decision.md`.
+
+This crate currently tests storage and safety-number helpers only. Live 1:1 against iOS is
+the gate for phase B, not a green `cargo test`.
+
+There is no CI. Do not add a workflow that cannot compile this crate (sibling path deps).
+CI was removed 2026-06-19 for that reason.
 
 ---
 
 ## Documentation & session notes
 
-All docs live in `~/Code/construct-docs` (Obsidian vault, flat domain folders:
-`architecture/ backend/ client/ cryptocore/ security/ decisions/ sessions/ …`).
-**The vault's `AGENTS.md` is authoritative** for structure and writing rules — read it before
-contributing docs. If a path is missing, search the domain folder rather than trusting old links.
+Docs live in `~/Code/construct-docs`. **The vault's `AGENTS.md` is authoritative** for
+structure and writing rules. If a path is missing, search the domain folder rather than
+trusting an old link.
 
-After any session with architectural changes, design decisions, root-cause analysis, or
+After any session with architectural changes, design decisions, root-cause analysis or
 non-obvious choices:
 
-1. Write a session note `sessions/YYYY-MM-DD-<topic>.md` (sections: Context / What Changed /
-   **Why** / Decisions / Open Questions) — `## Why` with rejected alternatives is mandatory.
-2. If it constrains future work, add/update `decisions/<slug>.md`.
+1. Write `sessions/YYYY-MM-DD-<topic>.md` (Context / What Changed / **Why** / Decisions /
+   Open Questions) — `## Why` with rejected alternatives is mandatory.
+2. If it constrains future work, add or update `decisions/<slug>.md`.
 3. Patch the affected spec in its domain folder in the **same** session.
-4. Append one line to `~/Code/construct-docs/log.md`: `[YYYY-MM-DD HH:MM] note | <topic>`.
-
-Session notes are plain markdown, no YAML frontmatter; `[[wikilinks]]` to other notes are welcome.
-Before creating a note, search for an existing one and extend it rather than duplicating.
+4. Append one line to `~/Code/construct-docs/log.md`.
