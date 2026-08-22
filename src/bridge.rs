@@ -230,11 +230,23 @@ async fn token_refresh_loop(
 }
 
 async fn do_refresh(
-    _server_url: &str,
-    _device_id: &str,
-    _refresh_token: &str,
+    server_url: &str,
+    device_id: &str,
+    refresh_token: &str,
 ) -> Result<TokenRefreshMsg> {
-    anyhow::bail!("token refresh is not wired to construct-transport yet")
+    let client = crate::grpc::GrpcClient::connect(server_url).await?;
+    client.set_device_id(Some(device_id.to_string())).await;
+    let (access_token, new_refresh, expires_at) =
+        crate::grpc::refresh_token(&client, refresh_token, device_id).await?;
+    Ok(TokenRefreshMsg::Refreshed {
+        access_token,
+        refresh_token: if new_refresh.is_empty() {
+            refresh_token.to_string()
+        } else {
+            new_refresh
+        },
+        expires_at,
+    })
 }
 
 fn now_unix_secs() -> i64 {

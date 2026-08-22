@@ -4,6 +4,7 @@ license = "MPL-2.0"
 version = "0.1.8"
 edition = "2024"
 rust-version = "1.96"
+repository = "https://github.com/konstruct-msg/construct-tui"
 
 [[bin]]
 name = "konstruct"
@@ -14,9 +15,20 @@ default = ["post-quantum"]
 post-quantum = ["construct-core/post-quantum"]
 
 [dependencies]
-# Crypto (Orchestrator) + QUIC/H3 gRPC pipe. Same split as iOS/Android.
+# Crypto (Orchestrator). gRPC-over-H3 lives in src/grpc/ (ported from construct-engine;
+# extractable later as a shared desktop client crate).
 construct-core = { path = "../construct-core" }
-construct-transport = { path = "../construct-transport" }
+
+# QUIC / HTTP/3 — same versions as construct-engine / construct-transport.
+quinn = "0.11"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-native-certs = "0.7"
+webpki-roots = "0.26"
+bytes = "1"
+http = "1"
+thiserror = "2"
 
 # TUI
 ratatui = "0.30"

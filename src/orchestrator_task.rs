@@ -749,14 +749,15 @@ async fn dispatch(
 /// Fetch a pre-key bundle from the gRPC key service and return it as
 /// the JSON string expected by `Orchestrator::init_session_with_bundle`.
 async fn fetch_bundle_json(
-    _grpc_url: &str,
-    _access_token: &str,
+    grpc_url: &str,
+    access_token: &str,
     _my_user_id: &str,
     _my_device_id: &str,
-    _user_id: &str,
+    user_id: &str,
 ) -> Result<String> {
-    tracing::warn!("pre-key bundle fetch is not wired to construct-transport yet");
-    anyhow::bail!("pre-key bundle fetch is not wired to construct-transport yet")
+    let client = crate::grpc::GrpcClient::connect_authed(grpc_url, access_token).await?;
+    let bundle = crate::grpc::get_pre_key_bundle(&client, user_id).await?;
+    Ok(serde_json::to_string(&bundle)?)
 }
 
 fn build_envelope(

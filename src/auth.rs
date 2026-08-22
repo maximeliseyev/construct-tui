@@ -1,7 +1,6 @@
 //! High-level authentication flow for construct-tui.
 //!
-//! Key generation is local. Server RPCs (PoW, register, authenticate, device
-//! link) will go through construct-transport; they currently return "not wired".
+//! Key generation is local. Server RPCs go through [`crate::grpc`].
 
 use anyhow::{Context, Result};
 
@@ -150,12 +149,17 @@ pub async fn register_new_device(
 
     step(RegistrationStep::SolvingPoW);
 
-    // Fetch PoW challenge from server
-    let (challenge, difficulty) = fetch_pow_challenge(server_url).await?;
+    let client = crate::grpc::GrpcClient::connect(server_url)
+        .await
+        .context("grpc connect")?;
+    client.set_device_id(Some(device_id.clone())).await;
+    let (challenge, difficulty) = crate::grpc::get_pow_challenge(&client)
+        .await
+        .context("pow challenge")?;
 
-    // Solve PoW
+    let challenge_for_pow = challenge.clone();
     let solution = tokio::task::spawn_blocking(move || {
-        construct_core::pow::compute_pow(&challenge, difficulty)
+        construct_core::pow::compute_pow(&challenge_for_pow, difficulty)
     })
     .await
     .context("PoW computation panicked")?;
@@ -163,9 +167,27 @@ pub async fn register_new_device(
     step(RegistrationStep::Registering);
     sleep(Duration::from_millis(MIN_STEP_MS)).await;
 
-    // Register device
-    let (user_id, access_token, refresh_token, expires_at) =
-        register_with_pow(server_url, username, &device_id, &keys_cfe_data, &solution).await?;
+    let pubs = crate::grpc::device_public_keys(
+        &signing_pair.public_key,
+        &identity_pair.public_key,
+        &spk_pair.public_key,
+        &spk_sig.to_bytes(),
+    );
+    let tokens = crate::grpc::register_device(
+        &client,
+        username.map(str::to_string),
+        &device_id,
+        pubs,
+        solution,
+        challenge,
+    )
+    .await
+    .context("register device")?;
+    let user_id = tokens.user_id;
+    let access_token = tokens.access_token;
+    let refresh_token = tokens.refresh_token;
+    let expires_at = tokens.expires_at;
+    let _ = keys_cfe_data;
 
     // 7. Build session (caller is responsible for saving — encrypted or plaintext)
     let session = Session {
@@ -228,9 +250,24 @@ pub async fn link_existing_device(server_url: &str, link_token: &str) -> Result<
         &private_keys,
     )?;
 
-    // 2. Confirm link — server verifies the token and returns JWT
-    let (user_id, access_token, refresh_token, expires_at) =
-        confirm_device_link(server_url, link_token, &device_id, &keys_cfe_data).await?;
+    let client = crate::grpc::GrpcClient::connect(server_url)
+        .await
+        .context("grpc connect")?;
+    client.set_device_id(Some(device_id.clone())).await;
+    let pubs = crate::grpc::device_public_keys(
+        &signing_pair.public_key,
+        &identity_pair.public_key,
+        &spk_pair.public_key,
+        &spk_sig.to_bytes(),
+    );
+    let tokens = crate::grpc::confirm_device_link(&client, link_token, &device_id, pubs)
+        .await
+        .context("confirm device link")?;
+    let user_id = tokens.user_id;
+    let access_token = tokens.access_token;
+    let refresh_token = tokens.refresh_token;
+    let expires_at = tokens.expires_at;
+    let _ = keys_cfe_data;
 
     // 3. Build session (caller is responsible for saving — encrypted or plaintext)
     let session = Session {
@@ -272,53 +309,28 @@ pub async fn authenticate_saved_session(session: Session, server_url: &str) -> R
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_array);
     let signature = signing_key.sign(message.as_bytes());
 
-    // Authenticate with server
-    let (user_id, access_token, _refresh_token, _expires_at) = authenticate_with_signature(
-        server_url,
+    let client = crate::grpc::GrpcClient::connect(server_url)
+        .await
+        .context("grpc connect")?;
+    client.set_device_id(Some(session.device_id.clone())).await;
+    let tokens = crate::grpc::authenticate_device(
+        &client,
         &session.device_id,
         timestamp,
         &signature.to_bytes(),
     )
-    .await?;
+    .await
+    .context("authenticate")?;
+
+    let mut session = session;
+    session.access_token = tokens.access_token.clone();
+    session.refresh_token = tokens.refresh_token;
+    session.expires_at = tokens.expires_at;
 
     Ok(AuthResult {
-        user_id,
+        user_id: tokens.user_id,
         device_id: session.device_id.clone(),
-        access_token,
+        access_token: tokens.access_token,
         session: Some(session),
     })
-}
-
-// ── Server RPCs (construct-transport; not wired yet) ───────────────────────
-
-async fn fetch_pow_challenge(_server_url: &str) -> Result<(String, u32)> {
-    anyhow::bail!("PoW challenge fetch is not wired to construct-transport yet")
-}
-
-async fn register_with_pow(
-    _server_url: &str,
-    _username: Option<&str>,
-    _device_id: &str,
-    _keys_cfe_data: &[u8],
-    _solution: &construct_core::pow::PowSolution,
-) -> Result<(String, String, String, i64)> {
-    anyhow::bail!("registration is not wired to construct-transport yet")
-}
-
-async fn confirm_device_link(
-    _server_url: &str,
-    _link_token: &str,
-    _device_id: &str,
-    _keys_cfe_data: &[u8],
-) -> Result<(String, String, String, i64)> {
-    anyhow::bail!("device link is not wired to construct-transport yet")
-}
-
-async fn authenticate_with_signature(
-    _server_url: &str,
-    _device_id: &str,
-    _timestamp: i64,
-    _signature: &[u8; 64],
-) -> Result<(String, String, String, i64)> {
-    anyhow::bail!("authentication is not wired to construct-transport yet")
 }

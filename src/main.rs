@@ -3,13 +3,13 @@ mod auth;
 mod bridge;
 mod config;
 mod event;
+mod grpc;
 mod invite;
 mod orchestrator_task;
 mod proto;
 mod screens;
 mod storage;
 mod streaming;
-mod transport;
 mod tui;
 
 use anyhow::Result;
@@ -83,7 +83,7 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // rustls 0.23+ is installed by construct-transport when a QuicClient connects.
+    // rustls CryptoProvider is installed on first GrpcClient::connect.
 
     let cli = Cli::parse();
 

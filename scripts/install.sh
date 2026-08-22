@@ -1,10 +1,10 @@
 #!/usr/bin/env sh
 # konstruct — one-line installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/maximeliseyev/construct-tui/main/scripts/install.sh | sh
+# Usage: curl -fsSL https://raw.githubusercontent.com/konstruct-msg/construct-tui/main/scripts/install.sh | sh
 # Not the supported install path until GitHub Releases exist again (CI was removed).
 set -e
 
-REPO="maximeliseyev/construct-tui"
+REPO="konstruct-msg/construct-tui"
 BIN="konstruct"
 INSTALL_DIR="${KONSTRUKT_INSTALL_DIR:-/usr/local/bin}"
 

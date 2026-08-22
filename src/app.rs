@@ -730,10 +730,24 @@ impl App {
 
         // ── Upload OTPKs in background ────────────────────────────────────────
         if !otpks.is_empty() {
-            tracing::info!(
-                "OTPKs generated: {} keys (upload not wired yet)",
-                otpks.len()
-            );
+            tracing::info!("OTPKs generated: {} keys", otpks.len());
+            let url = self.server_url.clone();
+            let token = access_token.clone();
+            let did = device_id.clone();
+            let keys = otpks.clone();
+            tokio::spawn(async move {
+                match crate::grpc::GrpcClient::connect_authed(&url, &token).await {
+                    Ok(client) => {
+                        client.set_device_id(Some(did.clone())).await;
+                        if let Err(e) =
+                            crate::grpc::upload_pre_keys(&client, &did, keys, false).await
+                        {
+                            tracing::warn!("OTPK upload failed: {e}");
+                        }
+                    }
+                    Err(e) => tracing::warn!("OTPK upload connect failed: {e}"),
+                }
+            });
         }
 
         // Relay stream events to the Orchestrator.
@@ -1407,10 +1421,34 @@ impl App {
                 let query = self.contact_search.query.trim().to_string();
                 if !query.is_empty() {
                     self.contact_search.searching = true;
-                    let _ = query;
-                    let _ = self
-                        .internal_tx
-                        .send(InternalEvent::ContactSearchResult(vec![]));
+                    let tx = self.internal_tx.clone();
+                    let url = self.server_url.clone();
+                    let token = self.access_token.clone();
+                    tokio::spawn(async move {
+                        let result = async {
+                            let client =
+                                crate::grpc::GrpcClient::connect_authed(&url, &token).await?;
+                            crate::grpc::find_user(&client, &query).await
+                        }
+                        .await;
+                        match result {
+                            Ok(Some(user_id)) => {
+                                let _ = tx.send(InternalEvent::ContactSearchResult(vec![
+                                    SearchResult {
+                                        user_id,
+                                        username: query.clone(),
+                                        display_name: query,
+                                    },
+                                ]));
+                            }
+                            Ok(None) => {
+                                let _ = tx.send(InternalEvent::ContactSearchResult(vec![]));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(InternalEvent::ContactSearchError(e.to_string()));
+                            }
+                        }
+                    });
                 }
             }
             KeyCode::Tab => self.contact_search.next(),

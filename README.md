@@ -42,7 +42,7 @@ Minimum terminal size: **80×24**.
 | Dependency | Version |
 |------------|---------|
 | Rust toolchain | stable ≥ 1.96 (matches `construct-core`) |
-| Sibling checkouts | `../construct-core`, `../construct-transport`, `../construct-protos` |
+| Sibling checkouts | `../construct-core`, `../construct-protos` |
 | `libsqlcipher` | bundled (no system install needed) |
 
 ```bash
@@ -130,7 +130,7 @@ konstruct logout
 
 On subsequent runs the session is loaded from disk and decrypted with the passphrase.
 
-End-to-end messaging against the live server / iOS client is **not yet working** (message stream is a stub; pre-key bundle fetch is unimplemented).
+gRPC (register, authenticate, device link, token refresh, pre-key bundle, FindUser, MessageStream) talks QUIC/H3 with system-root TLS. First real send/recv against iOS still needs a live session.
 
 ---
 
@@ -229,7 +229,7 @@ There is no CI in this repo (removed 2026-06-19; the project was too early-stage
 - **Messages** are stored in a SQLCipher AES-256 encrypted database.
 - **Signal Protocol** (X3DH + Double Ratchet) + **PQXDH** (Kyber-768) when built with default features.
 
-DPI-bypass (VEIL) is **not** integrated here. Transport is `construct-transport` (QUIC/H3), same crate iOS uses; the TUI has not opened a live connection yet.
+DPI-bypass (VEIL) is **not** integrated. Transport is gRPC-over-HTTP/3 in `src/grpc/` (ported from construct-engine; extractable later).
 
 ## Trademark
 

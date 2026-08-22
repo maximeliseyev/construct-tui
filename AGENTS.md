@@ -18,22 +18,19 @@ Do not treat the April 2026 TUI guide as current — it lives in
 
 ## Current stack (read before changing anything)
 
-Two parallel integration paths exist. Neither is finished.
-
 ```
 screens/  →  app.rs
-              ├── orchestrator_task.rs  →  construct-core Orchestrator   ← crypto / sessions
-              ├── transport.rs          →  construct-transport QuicClient ← QUIC/H3 (not wired yet)
-              └── streaming.rs          →  dummy loop (not a live stream)
+              ├── orchestrator_task.rs  →  construct-core Orchestrator
+              └── grpc/                 →  gRPC-over-H3 (ported from construct-engine)
+                    ├── client.rs       connection + unary
+                    ├── stream.rs       MessageStream bidi
+                    └── auth/keys/users typed RPCs
 ```
 
-- Crypto decisions belong in `construct-core::orchestration::Orchestrator`.
-  `orchestrator_task.rs` is the platform bridge (storage, timers, UI events).
-- `construct-engine` is **gone from this crate**. Same path as iOS/Android:
-  `construct-core` + `construct-transport` (+ VEIL later). Do not reintroduce
-  the engine.
-- `streaming.rs` is a stub. `fetch_bundle_json` and auth RPCs are not wired to
-  transport yet.
+- Crypto stays in `construct-core::orchestration::Orchestrator`.
+- Network I/O stays in `src/grpc/`. Screens and `app.rs` must not import `h3`/`quinn`.
+- `src/grpc/` is written to be liftable into a shared desktop crate later. Do not
+  smear it into widgets.
 - `--bridge` / `--headless` / `--config` are clap flags, not behaviour.
 
 Toolchain: stable ≥ 1.96. `Cargo.lock` must be regenerated after the engine drop.
@@ -47,11 +44,11 @@ main.rs
 ├── app.rs               — App state, event loop
 ├── orchestrator_task.rs — construct-core Orchestrator actor (preferred crypto path)
 ├── bridge.rs            — PlatformBridge + UI events from the orchestrator
-├── transport.rs         — construct-transport QuicClient (connection not opened yet)
+├── grpc/                — gRPC-over-H3 client (extractable later)
 ├── proto.rs             — prost types from construct-protos
-├── streaming.rs         — intended gRPC stream; currently a dummy loop
+├── streaming.rs         — MessageStream worker (uses grpc/)
 ├── storage.rs           — SQLCipher messages / sessions / acks
-├── auth.rs              — registration / restore (RPCs not wired yet)
+├── auth.rs              — registration / restore (gRPC via `grpc/`)
 ├── invite.rs            — invite link handling
 ├── tui.rs               — terminal setup / teardown
 ├── event.rs             — TUI input event types
@@ -59,15 +56,23 @@ main.rs
 └── screens/             — Ratatui widgets (chats, chat, settings, login, register…)
 ```
 
-Screens borrow from `App`. They must not call `construct-core` internals or open
-their own gRPC. Crypto goes through `orchestrator_task`; network I/O will go
-through `transport.rs`.
+Screens borrow from `App`. They must not call `construct-core` internals or
+`h3`/`quinn`. Crypto goes through `orchestrator_task`; network I/O through `grpc/`.
 
 ---
 
 ## Build & Run
 
-Sibling path deps: `../construct-core`, `../construct-transport`, `../construct-protos`.
+GitHub org: [konstruct-msg](https://github.com/konstruct-msg). Local siblings under `~/Code/`:
+
+| Checkout | GitHub | Role |
+|---|---|---|
+| `../construct-core` | [construct-core](https://github.com/konstruct-msg/construct-core) | crypto / Orchestrator (path dep) |
+| `../construct-protos` | | protobuf source of truth |
+| `../construct-veil` | [construct-veil](https://github.com/konstruct-msg/construct-veil) | DPI / obfs4 successor — not wired in TUI yet |
+
+This repo: [construct-tui](https://github.com/konstruct-msg/construct-tui).
+
 Toolchain: stable ≥ 1.96.
 
 ```bash
