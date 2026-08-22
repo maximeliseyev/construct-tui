@@ -14,9 +14,9 @@ default = ["post-quantum"]
 post-quantum = ["construct-core/post-quantum"]
 
 [dependencies]
-# Core engine — provides QUIC/H3/gRPC transport + crypto orchestration
-construct-engine = { path = "../construct-engine" }
+# Crypto (Orchestrator) + QUIC/H3 gRPC pipe. Same split as iOS/Android.
 construct-core = { path = "../construct-core" }
+construct-transport = { path = "../construct-transport" }
 
 # TUI
 ratatui = "0.30"

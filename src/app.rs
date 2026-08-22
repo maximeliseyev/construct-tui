@@ -8,17 +8,13 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Clear, Paragraph},
 };
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::Mutex;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
     auth::RegistrationStep,
     bridge::{BridgeEvent, TokenRefreshMsg},
     config::{self, Session, SessionKey, SessionState, TransportConfig},
-    engine_adapter::{EngineEvent, EngineHandle, build_engine_config},
     event::{Event, EventHandler, is_quit},
     screens::onboarding::OnboardingField,
     screens::{
@@ -29,7 +25,6 @@ use crate::{
     },
     tui::Tui,
 };
-use construct_engine::UiEvent;
 
 #[derive(Debug, Clone, PartialEq)]
 enum Screen {
@@ -108,8 +103,6 @@ pub(crate) enum InternalEvent {
         latency_ms: Option<u32>,
         is_relay: bool,
     },
-    /// Engine started and authenticated — store the handle for ongoing use.
-    EngineReady(EngineHandle),
 }
 
 /// Type alias referenced by `orchestrator_task` to send bridge events back to the UI.
@@ -180,17 +173,6 @@ pub struct App {
     our_identity_key: Option<Vec<u8>>,
     /// When `Some`, a delete-confirmation dialog is shown for the given contact id.
     delete_confirm: Option<String>,
-    /// Handle to the construct-engine (set after engine initialization).
-    #[allow(dead_code)]
-    engine_handle: Option<EngineHandle>,
-    /// Engine event receiver for the main loop.
-    engine_event_rx: Option<tokio::sync::watch::Receiver<Option<EngineEvent>>>,
-    /// Pending oneshot senders waiting for a PreKeyBundleReady callback.
-    /// Keyed by user_id; orchestrator task inserts before dispatching FetchPreKeyBundle.
-    pending_bundles: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
-    /// P2P connection manager (Phase 3).
-    #[allow(dead_code)]
-    p2p_manager: Option<Arc<construct_engine::P2PManager>>,
 }
 
 impl App {
@@ -245,10 +227,6 @@ impl App {
             access_token: String::new(),
             our_identity_key: None,
             delete_confirm: None,
-            engine_handle: None,
-            engine_event_rx: None,
-            pending_bundles: Arc::new(Mutex::new(HashMap::new())),
-            p2p_manager: None,
         }
     }
 
@@ -265,18 +243,6 @@ impl App {
             tokio::select! {
                 Some(event) = events.next() => self.handle_event(event),
                 Some(internal) = self.internal_rx.recv() => self.handle_internal(internal),
-                // Engine event processing
-                _ = async {
-                    if let Some(ref mut rx) = self.engine_event_rx {
-                        let _ = rx.changed().await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => {
-                    if let Some(evt) = self.engine_event_rx.as_ref().and_then(|rx| rx.borrow().clone()) {
-                        self.handle_engine_event(evt);
-                    }
-                }
             }
         }
         Ok(())
@@ -305,21 +271,19 @@ impl App {
         let url = self.server_url.clone();
         tokio::spawn(async move {
             match crate::auth::try_restore_session(&url).await {
-                Ok(Some(output)) => {
-                    let full = output
-                        .result
+                Ok(Some(result)) => {
+                    let full = result
                         .session
                         .clone()
                         .expect("try_restore_session always returns session");
                     let msg = AuthMsg::Success(Box::new(AuthSuccess {
-                        user_id: output.result.user_id,
-                        device_id: output.result.device_id,
-                        access_token: output.result.access_token,
+                        user_id: result.user_id,
+                        device_id: result.device_id,
+                        access_token: result.access_token,
                         full_session: full,
                         pending_save: None, // already saved inside try_restore_session
                     }));
                     let _ = tx.send(InternalEvent::Auth(msg));
-                    let _ = tx.send(InternalEvent::EngineReady(output.engine));
                 }
                 Ok(None) => {
                     let _ = tx.send(InternalEvent::Auth(AuthMsg::Failure("no_session".into())));
@@ -332,55 +296,6 @@ impl App {
         self.screen = Screen::Connecting("Restoring session…".into());
     }
 
-    /// Initialize construct-engine with the given session.
-    #[allow(dead_code)]
-    async fn init_engine(&mut self, session: &Session) -> Result<(), anyhow::Error> {
-        use construct_core::cfe::{CfePrivateKeysV1, encode};
-        use serde_bytes::ByteBuf;
-
-        // Encode private keys to CFE format
-        let identity_secret = hex::decode(&session.identity_key_hex)?;
-        let signing_secret = hex::decode(&session.signing_key_hex)?;
-        let spk_secret = hex::decode(&session.spk_key_hex)?;
-        let spk_sig = hex::decode(&session.spk_sig_hex)?;
-
-        let private_keys = CfePrivateKeysV1 {
-            suite_id: 1, // CLASSIC
-            ik_priv: ByteBuf::from(identity_secret),
-            sk_priv: ByteBuf::from(signing_secret),
-            spk_priv: ByteBuf::from(spk_secret),
-            spk_sig: ByteBuf::from(spk_sig),
-            spk_id: 0,
-            ik_pub: ByteBuf::from(hex::decode(&session.identity_key_hex)?),
-            vk_pub: ByteBuf::from(hex::decode(&session.signing_key_hex)?),
-            spk_pub: ByteBuf::from(hex::decode(&session.spk_key_hex)?),
-            old_spks: vec![],
-        };
-        let keys_cfe_data = encode(
-            construct_core::cfe::CfeMessageType::PrivateKeys,
-            &private_keys,
-        )?;
-
-        let config = build_engine_config(
-            &self.server_url,
-            Some(&session.user_id),
-            Some(&session.device_id),
-            Some(&session.access_token),
-            &keys_cfe_data,
-        );
-
-        self.engine_handle = Some(crate::engine_adapter::spawn_engine(config).await?);
-
-        if let Some(ref handle) = self.engine_handle {
-            self.engine_event_rx = Some(handle.event_receiver());
-
-            // Signal platform ready to start engine operations
-            handle.dispatch(UiEvent::PlatformReady);
-        }
-
-        Ok(())
-    }
-
     /// Authenticate using a session already decrypted in memory (after Unlock screen).
     fn start_auth_restore_preloaded(&mut self, session: Session) {
         let tx = self.internal_tx.clone();
@@ -388,21 +303,19 @@ impl App {
 
         tokio::spawn(async move {
             match crate::auth::authenticate_saved_session(session.clone(), &server_url).await {
-                Ok(output) => {
-                    let full = output
-                        .result
+                Ok(result) => {
+                    let full = result
                         .session
                         .clone()
                         .expect("authenticate_saved_session always returns session");
                     let msg = AuthMsg::Success(Box::new(AuthSuccess {
-                        user_id: output.result.user_id,
-                        device_id: output.result.device_id,
-                        access_token: output.result.access_token,
+                        user_id: result.user_id,
+                        device_id: result.device_id,
+                        access_token: result.access_token,
                         full_session: full,
-                        pending_save: output.result.session,
+                        pending_save: result.session,
                     }));
                     let _ = tx.send(InternalEvent::Auth(msg));
-                    let _ = tx.send(InternalEvent::EngineReady(output.engine));
                 }
                 Err(e) => {
                     let _ = tx.send(InternalEvent::Auth(AuthMsg::Failure(format!("{e:#}"))));
@@ -434,21 +347,19 @@ impl App {
 
         tokio::spawn(async move {
             match crate::auth::register_new_device(&url, name.as_deref(), &step_tx).await {
-                Ok(output) => {
-                    let full = output
-                        .result
+                Ok(result) => {
+                    let full = result
                         .session
                         .clone()
                         .expect("register_new_device always returns session");
                     let msg = AuthMsg::Success(Box::new(AuthSuccess {
-                        user_id: output.result.user_id,
-                        device_id: output.result.device_id,
-                        access_token: output.result.access_token,
+                        user_id: result.user_id,
+                        device_id: result.device_id,
+                        access_token: result.access_token,
                         full_session: full,
-                        pending_save: output.result.session,
+                        pending_save: result.session,
                     }));
                     let _ = tx.send(InternalEvent::Auth(msg));
-                    let _ = tx.send(InternalEvent::EngineReady(output.engine));
                 }
                 Err(e) => {
                     let _ = tx.send(InternalEvent::Auth(AuthMsg::Failure(format!("{e:#}"))));
@@ -489,21 +400,19 @@ impl App {
         let url = self.server_url.clone();
         tokio::spawn(async move {
             match crate::auth::link_existing_device(&url, &token).await {
-                Ok(output) => {
-                    let full = output
-                        .result
+                Ok(result) => {
+                    let full = result
                         .session
                         .clone()
                         .expect("link_existing_device always returns session");
                     let msg = AuthMsg::Success(Box::new(AuthSuccess {
-                        user_id: output.result.user_id,
-                        device_id: output.result.device_id,
-                        access_token: output.result.access_token,
+                        user_id: result.user_id,
+                        device_id: result.device_id,
+                        access_token: result.access_token,
                         full_session: full,
-                        pending_save: output.result.session,
+                        pending_save: result.session,
                     }));
                     let _ = tx.send(InternalEvent::Auth(msg));
-                    let _ = tx.send(InternalEvent::EngineReady(output.engine));
                 }
                 Err(e) => {
                     let _ = tx.send(InternalEvent::Auth(AuthMsg::Failure(format!("{e:#}"))));
@@ -549,201 +458,17 @@ impl App {
             } => {
                 self.handle_p2p_status(peer_id, connected, latency_ms, is_relay);
             }
-            InternalEvent::EngineReady(handle) => {
-                self.engine_event_rx = Some(handle.event_receiver());
-                self.engine_handle = Some(handle);
-            }
-        }
-    }
-
-    /// Handle events from construct-engine.
-    fn handle_engine_event(&mut self, evt: EngineEvent) {
-        match evt {
-            EngineEvent::AuthTokenSet {
-                user_id,
-                access_token,
-                refresh_token,
-                expires_at,
-            } => {
-                self.user_id = user_id.clone();
-                self.access_token = access_token.clone();
-                self.status = format!("Connected as {}", user_id);
-
-                // Update session if we have one
-                if let Some(ref mut session) = self.current_session {
-                    session.access_token = access_token;
-                    session.refresh_token = refresh_token;
-                    session.expires_at = expires_at;
-                }
-            }
-            EngineEvent::RegistrationComplete { user_id, device_id } => {
-                self.user_id = user_id;
-                self.device_id = device_id;
-            }
-            EngineEvent::ClearAuth => {
-                self.do_logout();
-            }
-            EngineEvent::ConnectionStateChanged { connected } => {
-                self.connection = if connected {
-                    ConnectionState::Connected {
-                        transport: transport_label(&self.transport).into(),
-                        latency_ms: None,
-                    }
-                } else {
-                    ConnectionState::Disconnected
-                };
-            }
-            EngineEvent::NetworkError { message } => {
-                self.status = format!("Network: {}", message);
-            }
-            EngineEvent::StreamReady { stream_cursor: _ } => {
-                self.status = "Stream ready".into();
-            }
-            EngineEvent::StreamError { message } => {
-                self.status = format!("Stream error: {}", message);
-            }
-            EngineEvent::PreKeyBundleReady {
-                user_id,
-                bundle_bytes,
-            } => match Self::bundle_bytes_to_json(&bundle_bytes) {
-                Ok(json) => {
-                    let mut pending = self.pending_bundles.lock().unwrap();
-                    if let Some(tx) = pending.remove(&user_id) {
-                        let _ = tx.send(json);
-                    } else {
-                        tracing::warn!("PreKeyBundleReady for {user_id} but no pending waiter");
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("bundle_bytes_to_json failed: {e}");
-                    let mut pending = self.pending_bundles.lock().unwrap();
-                    if let Some(tx) = pending.remove(&user_id) {
-                        let _ = tx.send(String::new());
-                    }
-                }
-            },
-            EngineEvent::OtpksUploaded {
-                uploaded,
-                server_count,
-            } => {
-                tracing::info!("OTPKs uploaded: {} (server: {})", uploaded, server_count);
-            }
-            EngineEvent::PreKeyCountUpdated {
-                count,
-                recommended_minimum,
-            } => {
-                tracing::info!("Prekey count: {} (min: {})", count, recommended_minimum);
-            }
-            EngineEvent::SpkRotated { key_id } => {
-                tracing::info!("SPK rotated: {}", key_id);
-            }
-            EngineEvent::LoadKeychain { key } => {
-                // Handle keychain load request from engine
-                tracing::debug!("Engine requests keychain load: {}", key);
-            }
-            EngineEvent::SaveKeychain { key, data } => {
-                // Handle keychain save request from engine
-                tracing::debug!(
-                    "Engine requests keychain save: {} ({} bytes)",
-                    key,
-                    data.len()
-                );
-            }
-            EngineEvent::SessionError {
-                contact_id,
-                message,
-            } => {
-                self.status = format!("Session error ({}): {}", contact_id, message);
-            }
-            EngineEvent::UpdateMessageStatus { local_id, status } => {
-                // Update message delivery status
-                self.callback_on_message_status(&local_id, status);
-            }
-            EngineEvent::DisplayMessage {
-                message_id,
-                plaintext,
-                sender_id,
-                conversation_id,
-                timestamp: _,
-            } => {
-                // Display decrypted message
-                self.handle_decrypted_message(message_id, plaintext, sender_id, conversation_id);
-            }
-            EngineEvent::P2PStatus {
-                peer_id,
-                connected,
-                latency_ms,
-                is_relay,
-            } => {
-                self.handle_p2p_status(peer_id, connected, latency_ms, is_relay);
-            }
-            EngineEvent::UserFound { user_id, username } => {
-                let result = crate::screens::contact_search::SearchResult {
-                    user_id,
-                    username: username.clone(),
-                    display_name: username,
-                };
-                let _ = self
-                    .internal_tx
-                    .send(InternalEvent::ContactSearchResult(vec![result]));
-                self.contact_search.searching = false;
-            }
-            EngineEvent::UserNotFound { .. } => {
-                let _ = self
-                    .internal_tx
-                    .send(InternalEvent::ContactSearchResult(vec![]));
-                self.contact_search.searching = false;
-            }
         }
     }
 
     /// Update message status UI (sent/delivered/read).
+    #[allow(dead_code)]
     fn callback_on_message_status(&mut self, _local_id: &str, _status: u8) {
         // TODO: Implement message status UI updates
     }
 
-    /// Decode raw `GetPreKeyBundleResponse` proto bytes into the JSON string
-    /// expected by `Orchestrator::init_session_with_bundle`.
-    fn bundle_bytes_to_json(bytes: &[u8]) -> anyhow::Result<String> {
-        use construct_core::crypto::SuiteID;
-        use construct_core::crypto::handshake::x3dh::X3DHPublicKeyBundle;
-        use construct_engine::proto::core::v1::CryptoSuite;
-        use construct_engine::proto::services::v1::GetPreKeyBundleResponse;
-        use prost::Message;
-
-        let resp = GetPreKeyBundleResponse::decode(bytes)
-            .map_err(|e| anyhow::anyhow!("decode bundle: {e}"))?;
-        let bundle = resp
-            .bundle
-            .ok_or_else(|| anyhow::anyhow!("no bundle in response"))?;
-
-        let cs = bundle.crypto_suite;
-        let suite_id = if cs == CryptoSuite::HybridKyber1024X25519 as i32
-            || cs == CryptoSuite::HybridKyber768X25519 as i32
-        {
-            SuiteID::PQ_HYBRID
-        } else {
-            SuiteID::CLASSIC
-        };
-
-        let x3dh = X3DHPublicKeyBundle {
-            identity_public: bundle.identity_key.to_vec(),
-            signed_prekey_public: bundle.signed_pre_key.to_vec(),
-            signature: bundle.signed_pre_key_signature.to_vec(),
-            verifying_key: resp.verifying_key.to_vec(),
-            suite_id,
-            one_time_prekey_public: bundle.one_time_pre_key.map(|b| b.to_vec()),
-            one_time_prekey_id: bundle.one_time_pre_key_id,
-            spk_uploaded_at: bundle.spk_uploaded_at as u64,
-            spk_rotation_epoch: bundle.spk_rotation_epoch,
-            kyber_spk_uploaded_at: bundle.kyber_spk_uploaded_at.unwrap_or(0) as u64,
-            kyber_spk_rotation_epoch: bundle.kyber_spk_rotation_epoch.unwrap_or(0),
-        };
-
-        serde_json::to_string(&x3dh).map_err(Into::into)
-    }
-
-    /// Handle a decrypted message from the engine.
+    /// Handle a decrypted message (legacy UI path; orchestrator also stores).
+    #[allow(dead_code)]
     fn handle_decrypted_message(
         &mut self,
         message_id: String,
@@ -769,8 +494,7 @@ impl App {
             self.chat_view.on_new_message();
         }
 
-        // TODO: Save to storage when engine integration is complete
-        // The engine handles persistence via SaveKeychain callbacks
+        // Persistence is handled by orchestrator_task on MessageDecrypted.
     }
 
     fn handle_auth_msg(&mut self, msg: AuthMsg) {
@@ -801,9 +525,6 @@ impl App {
                 );
                 // Keep the decrypted session in memory for token-refresh re-saves.
                 self.current_session = Some(full_session.clone());
-
-                // Initialize P2P manager (Phase 3)
-                self.init_p2p_manager();
 
                 if let Some(session) = pending_save {
                     self.start_token_refresh(&session);
@@ -845,7 +566,6 @@ impl App {
                 } else {
                     // Session was already saved (restore-from-disk path) — start right away.
                     self.start_orchestrator(full_session, user_id, device_id, access_token);
-                    self.init_p2p_manager();
                     self.screen = Screen::Main;
                 }
             }
@@ -1002,8 +722,6 @@ impl App {
             access_token.clone(),
             user_id.clone(),
             device_id.clone(),
-            self.engine_handle.clone(),
-            Arc::clone(&self.pending_bundles),
         );
 
         // Fire AppLaunched to trigger session GC / prewarm sweep.
@@ -1012,10 +730,10 @@ impl App {
 
         // ── Upload OTPKs in background ────────────────────────────────────────
         if !otpks.is_empty() {
-            // OTPK upload is now handled by construct-engine automatically via UiEvent::UploadOtpks
-            // The engine checks prekey count and uploads when below minimum.
-            tracing::info!("OTPKs generated: {} keys", otpks.len());
-            tracing::info!("OTPK upload: handled by construct-engine automatically");
+            tracing::info!(
+                "OTPKs generated: {} keys (upload not wired yet)",
+                otpks.len()
+            );
         }
 
         // Relay stream events to the Orchestrator.
@@ -1036,7 +754,7 @@ impl App {
                                 .unwrap_or_default();
                             let message_id = match &envelope.message_id_type {
                                 Some(
-                                    construct_engine::proto::core::v1::envelope::MessageIdType::MessageId(id),
+                                    crate::proto::core::v1::envelope::MessageIdType::MessageId(id),
                                 ) => id.clone(),
                                 _ => String::new(),
                             };
@@ -1100,39 +818,6 @@ impl App {
         });
     }
 
-    /// Initialize the P2P connection manager.
-    fn init_p2p_manager(&mut self) {
-        use construct_engine::{P2PConfig, P2PManager};
-
-        let config = P2PConfig::default();
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        let manager = Arc::new(P2PManager::new(config, event_tx));
-
-        // Spawn task to forward P2P events to internal channel
-        let internal_tx = self.internal_tx.clone();
-        tokio::spawn(async move {
-            while let Some(evt) = event_rx.recv().await {
-                if let UiEvent::P2PStatusReport {
-                    peer_id,
-                    connected,
-                    latency_ms,
-                    is_relay,
-                } = evt
-                {
-                    let _ = internal_tx.send(InternalEvent::P2PStatus {
-                        peer_id,
-                        connected,
-                        latency_ms,
-                        is_relay,
-                    });
-                }
-            }
-        });
-
-        self.p2p_manager = Some(manager);
-    }
-
     fn handle_token_refresh_msg(&mut self, msg: TokenRefreshMsg) {
         match msg {
             TokenRefreshMsg::Refreshed {
@@ -1165,21 +850,19 @@ impl App {
         let server_url = self.server_url.clone();
         tokio::spawn(async move {
             match crate::auth::authenticate_saved_session(session, &server_url).await {
-                Ok(output) => {
-                    let full = output
-                        .result
+                Ok(result) => {
+                    let full = result
                         .session
                         .clone()
                         .expect("authenticate_saved_session always returns session");
                     let msg = AuthMsg::Success(Box::new(AuthSuccess {
-                        user_id: output.result.user_id,
-                        device_id: output.result.device_id,
-                        access_token: output.result.access_token,
+                        user_id: result.user_id,
+                        device_id: result.device_id,
+                        access_token: result.access_token,
                         full_session: full.clone(),
                         pending_save: Some(full),
                     }));
                     let _ = tx.send(InternalEvent::Auth(msg));
-                    let _ = tx.send(InternalEvent::EngineReady(output.engine));
                 }
                 Err(e) => {
                     let _ = tx.send(InternalEvent::Auth(AuthMsg::Failure(format!(
@@ -1724,13 +1407,10 @@ impl App {
                 let query = self.contact_search.query.trim().to_string();
                 if !query.is_empty() {
                     self.contact_search.searching = true;
-                    if let Some(ref engine) = self.engine_handle {
-                        engine.dispatch(UiEvent::SearchUser { query });
-                    } else {
-                        let _ = self
-                            .internal_tx
-                            .send(InternalEvent::ContactSearchResult(vec![]));
-                    }
+                    let _ = query;
+                    let _ = self
+                        .internal_tx
+                        .send(InternalEvent::ContactSearchResult(vec![]));
                 }
             }
             KeyCode::Tab => self.contact_search.next(),

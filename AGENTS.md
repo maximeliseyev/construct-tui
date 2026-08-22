@@ -23,23 +23,20 @@ Two parallel integration paths exist. Neither is finished.
 ```
 screens/  →  app.rs
               ├── orchestrator_task.rs  →  construct-core Orchestrator   ← crypto / sessions
-              ├── engine_adapter.rs     →  construct-engine UiEvent      ← retired 2026-07-28
+              ├── transport.rs          →  construct-transport QuicClient ← QUIC/H3 (not wired yet)
               └── streaming.rs          →  dummy loop (not a live stream)
 ```
 
 - Crypto decisions belong in `construct-core::orchestration::Orchestrator`.
   `orchestrator_task.rs` is the platform bridge (storage, timers, UI events).
-- `construct-engine` is **retired**. iOS, macOS, and Android go
-  `construct-core` + `construct-transport` + `construct-veil`. This TUI follows
-  the same path. Do not add `UiEvent` / engine surface; do not spend time making
-  the engine compile against current core.
-- `streaming.rs` is a stub. `fetch_bundle_json` in `orchestrator_task.rs` always
-  errors (`"Pre-key bundle fetch requires engine integration"`).
+- `construct-engine` is **gone from this crate**. Same path as iOS/Android:
+  `construct-core` + `construct-transport` (+ VEIL later). Do not reintroduce
+  the engine.
+- `streaming.rs` is a stub. `fetch_bundle_json` and auth RPCs are not wired to
+  transport yet.
 - `--bridge` / `--headless` / `--config` are clap flags, not behaviour.
 
-Known compile blockers as of 2026-08-22: stale `Cargo.lock` (`construct-core` 0.8.4
-vs live 0.12.4), leftover `construct-ice` patch, local rustc older than core's
-`rust-version = "1.96"`.
+Toolchain: stable ≥ 1.96. `Cargo.lock` must be regenerated after the engine drop.
 
 ---
 
@@ -50,10 +47,11 @@ main.rs
 ├── app.rs               — App state, event loop
 ├── orchestrator_task.rs — construct-core Orchestrator actor (preferred crypto path)
 ├── bridge.rs            — PlatformBridge + UI events from the orchestrator
-├── engine_adapter.rs    — leftover ConstructEngine wrapper; do not extend
+├── transport.rs         — construct-transport QuicClient (connection not opened yet)
+├── proto.rs             — prost types from construct-protos
 ├── streaming.rs         — intended gRPC stream; currently a dummy loop
 ├── storage.rs           — SQLCipher messages / sessions / acks
-├── auth.rs              — registration / restore (still talks about the engine)
+├── auth.rs              — registration / restore (RPCs not wired yet)
 ├── invite.rs            — invite link handling
 ├── tui.rs               — terminal setup / teardown
 ├── event.rs             — TUI input event types
@@ -61,15 +59,15 @@ main.rs
 └── screens/             — Ratatui widgets (chats, chat, settings, login, register…)
 ```
 
-Screens borrow from `App`. They must not call `construct-engine` or `construct-core`
-internals. Crypto/network work goes through `orchestrator_task` (today) or a future
-transport client — not through widgets.
+Screens borrow from `App`. They must not call `construct-core` internals or open
+their own gRPC. Crypto goes through `orchestrator_task`; network I/O will go
+through `transport.rs`.
 
 ---
 
 ## Build & Run
 
-Sibling path deps: `../construct-core`, `../construct-engine`.
+Sibling path deps: `../construct-core`, `../construct-transport`, `../construct-protos`.
 Toolchain: stable ≥ 1.96.
 
 ```bash

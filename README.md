@@ -42,7 +42,7 @@ Minimum terminal size: **80×24**.
 | Dependency | Version |
 |------------|---------|
 | Rust toolchain | stable ≥ 1.96 (matches `construct-core`) |
-| Sibling checkouts | `../construct-core` and `../construct-engine` (path deps) |
+| Sibling checkouts | `../construct-core`, `../construct-transport`, `../construct-protos` |
 | `libsqlcipher` | bundled (no system install needed) |
 
 ```bash
@@ -229,7 +229,7 @@ There is no CI in this repo (removed 2026-06-19; the project was too early-stage
 - **Messages** are stored in a SQLCipher AES-256 encrypted database.
 - **Signal Protocol** (X3DH + Double Ratchet) + **PQXDH** (Kyber-768) when built with default features.
 
-DPI-bypass (VEIL) is **not** integrated here. iOS/Android use `construct-veil` via `construct-core`; this client still points at the retired `construct-engine`.
+DPI-bypass (VEIL) is **not** integrated here. Transport is `construct-transport` (QUIC/H3), same crate iOS uses; the TUI has not opened a live connection yet.
 
 ## Trademark
 

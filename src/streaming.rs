@@ -1,11 +1,12 @@
-//! Message streaming via construct-engine.
+//! Message streaming over construct-transport (QUIC/H3 gRPC).
+//!
+//! The worker is still a placeholder: it accepts StreamCmd and reports Connected,
+//! but does not yet open a real bidi stream. Wire it to
+//! [`crate::transport::QuicClient::open_stream`] next.
 
 use tokio::sync::mpsc;
 
-// Re-export Envelope type from engine's proto module
-pub use construct_engine::proto::core::v1::Envelope;
-
-// ── Public API ────────────────────────────────────────────────────────────────
+pub use crate::proto::core::v1::Envelope;
 
 /// Commands sent **to** the stream handler from the app.
 #[derive(Debug)]
@@ -35,9 +36,6 @@ pub enum StreamEvent {
 }
 
 /// Start the streaming handler and return (cmd_tx, event_rx).
-///
-/// The handler runs in a background tokio task and forwards commands
-/// to the construct-engine via UiEvent.
 pub fn spawn_stream_worker(
     _server_url: String,
     _access_token: String,
@@ -46,29 +44,17 @@ pub fn spawn_stream_worker(
     let (cmd_tx, cmd_rx) = mpsc::channel::<StreamCmd>(64);
     let (event_tx, event_rx) = mpsc::channel::<StreamEvent>(256);
 
-    // For now, just spawn a dummy loop that will be replaced by engine integration
     tokio::spawn(async move {
-        // The engine handles all streaming internally.
-        // This is a placeholder that will be removed when app.rs is updated
-        // to use engine_adapter directly.
-
-        // Send initial Connected event
         let _ = event_tx.send(StreamEvent::Connected).await;
-
-        // Wait for commands
-        let mut _cmd_rx = cmd_rx;
-        while let Some(_cmd) = _cmd_rx.recv().await {
-            // Commands will be handled by engine via app.rs
-            // This is a stub for backward compatibility
-        }
-
+        let mut cmd_rx = cmd_rx;
+        while let Some(_cmd) = cmd_rx.recv().await {}
         let _ = event_tx.send(StreamEvent::Disconnected).await;
     });
 
     (cmd_tx, event_rx)
 }
 
-/// Helper to encode an Envelope for sending via engine.
+/// Helper to encode an Envelope for sending.
 #[allow(dead_code)]
 pub fn encode_envelope(
     conversation_id: String,
@@ -78,9 +64,9 @@ pub fn encode_envelope(
     Envelope {
         conversation_id,
         encrypted_payload: encrypted_payload.into(),
-        message_id_type: Some(
-            construct_engine::proto::core::v1::envelope::MessageIdType::MessageId(message_id),
-        ),
+        message_id_type: Some(crate::proto::core::v1::envelope::MessageIdType::MessageId(
+            message_id,
+        )),
         ..Default::default()
     }
 }

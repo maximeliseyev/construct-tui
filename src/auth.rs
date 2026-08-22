@@ -1,7 +1,7 @@
-//! High-level authentication flow for construct-tui using construct-engine.
+//! High-level authentication flow for construct-tui.
 //!
-//! On first run: generate device keys → dispatch UiEvent::RegisterDevice → save Session.
-//! On returning: load Session → dispatch UiEvent::Authenticate → update tokens.
+//! Key generation is local. Server RPCs (PoW, register, authenticate, device
+//! link) will go through construct-transport; they currently return "not wired".
 
 use anyhow::{Context, Result};
 
@@ -67,8 +67,6 @@ pub async fn try_restore_session(server_url: &str) -> Result<Option<AuthResult>>
         return Ok(None);
     };
 
-    // For now, use direct authentication with the saved session.
-    // In the future, this should dispatch UiEvent::Authenticate to the engine.
     let result = authenticate_saved_session(session.clone(), server_url).await?;
 
     // Refresh stored tokens
@@ -138,6 +136,8 @@ pub async fn register_new_device(
         vk_pub: ByteBuf::from(signing_pair.public_key.to_vec()),
         spk_pub: ByteBuf::from(spk_pair.public_key.to_vec()),
         old_spks: vec![],
+        hybrid_sig_priv: None,
+        kyber_spk: None,
     };
     let keys_cfe_data = encode(
         construct_core::cfe::CfeMessageType::PrivateKeys,
@@ -148,8 +148,6 @@ pub async fn register_new_device(
     step(RegistrationStep::Connecting);
     sleep(Duration::from_millis(MIN_STEP_MS)).await;
 
-    // 6. For now, solve PoW and register directly
-    // TODO: Use engine's UiEvent::RegisterDevice with PoW challenge
     step(RegistrationStep::SolvingPoW);
 
     // Fetch PoW challenge from server
@@ -222,6 +220,8 @@ pub async fn link_existing_device(server_url: &str, link_token: &str) -> Result<
         vk_pub: ByteBuf::from(signing_pair.public_key.to_vec()),
         spk_pub: ByteBuf::from(spk_pair.public_key.to_vec()),
         old_spks: vec![],
+        hybrid_sig_priv: None,
+        kyber_spk: None,
     };
     let keys_cfe_data = encode(
         construct_core::cfe::CfeMessageType::PrivateKeys,
@@ -289,14 +289,10 @@ pub async fn authenticate_saved_session(session: Session, server_url: &str) -> R
     })
 }
 
-// ── Helper functions for direct server communication ───────────────────────
-// These will be replaced with engine dispatch in the next iteration.
+// ── Server RPCs (construct-transport; not wired yet) ───────────────────────
 
 async fn fetch_pow_challenge(_server_url: &str) -> Result<(String, u32)> {
-    // TODO: Use engine's UiEvent::RegisterDevice which handles PoW internally
-    // For now, return dummy values - this needs proper gRPC/HTTP client
-    // or engine integration
-    anyhow::bail!("PoW challenge fetch requires engine integration")
+    anyhow::bail!("PoW challenge fetch is not wired to construct-transport yet")
 }
 
 async fn register_with_pow(
@@ -306,8 +302,7 @@ async fn register_with_pow(
     _keys_cfe_data: &[u8],
     _solution: &construct_core::pow::PowSolution,
 ) -> Result<(String, String, String, i64)> {
-    // TODO: Use engine's UiEvent::RegisterDevice
-    anyhow::bail!("Registration requires engine integration")
+    anyhow::bail!("registration is not wired to construct-transport yet")
 }
 
 async fn confirm_device_link(
@@ -316,8 +311,7 @@ async fn confirm_device_link(
     _device_id: &str,
     _keys_cfe_data: &[u8],
 ) -> Result<(String, String, String, i64)> {
-    // TODO: Use engine's UiEvent for device linking
-    anyhow::bail!("Device link requires engine integration")
+    anyhow::bail!("device link is not wired to construct-transport yet")
 }
 
 async fn authenticate_with_signature(
@@ -326,6 +320,5 @@ async fn authenticate_with_signature(
     _timestamp: i64,
     _signature: &[u8; 64],
 ) -> Result<(String, String, String, i64)> {
-    // TODO: Use engine's UiEvent::Authenticate
-    anyhow::bail!("Authentication requires engine integration")
+    anyhow::bail!("authentication is not wired to construct-transport yet")
 }

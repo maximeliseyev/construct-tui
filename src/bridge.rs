@@ -234,9 +234,7 @@ async fn do_refresh(
     _device_id: &str,
     _refresh_token: &str,
 ) -> Result<TokenRefreshMsg> {
-    // TODO: Use engine's UiEvent::RefreshToken for token refresh
-    // For now, return an error to indicate this needs engine integration
-    anyhow::bail!("Token refresh requires engine integration — dispatch UiEvent::RefreshToken")
+    anyhow::bail!("token refresh is not wired to construct-transport yet")
 }
 
 fn now_unix_secs() -> i64 {

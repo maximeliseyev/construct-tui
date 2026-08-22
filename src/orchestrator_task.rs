@@ -29,9 +29,9 @@ use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
 use crate::bridge::BridgeEvent;
+use crate::proto::core::v1::{ContentType, Envelope, UserId, envelope::MessageIdType};
 use crate::storage::Storage;
 use crate::streaming::StreamCmd;
-use construct_engine::proto::core::v1::{ContentType, Envelope, UserId, envelope::MessageIdType};
 
 // ── Public handle ─────────────────────────────────────────────────────────────
 
@@ -276,6 +276,7 @@ async fn dispatch(
                             None,
                             None,
                             None,
+                            false,
                         );
                     }
                 }
@@ -288,6 +289,7 @@ async fn dispatch(
                         None,
                         None,
                         None,
+                        false,
                     );
                 }
                 session_inited.insert(contact_id.clone());
@@ -349,6 +351,8 @@ async fn dispatch(
             // Calls not yet implemented in TUI.
         }
 
+        Action::EndSessionSuppressed { .. } | Action::MessageQueuedPendingInit { .. } => {}
+
         // ── Session healing ─────────────────────────────────────────────────
         Action::SessionHealNeeded { contact_id, role } => {
             // Dedup: if InitSession already succeeded for this contact in the
@@ -405,6 +409,7 @@ async fn dispatch(
                                 None,
                                 None,
                                 None,
+                                false,
                             );
                         }
                         follow_ups.push(IncomingEvent::SessionInitCompleted {
@@ -750,9 +755,8 @@ async fn fetch_bundle_json(
     _my_device_id: &str,
     _user_id: &str,
 ) -> Result<String> {
-    // TODO: Use engine's UiEvent::FetchPreKeyBundle
-    tracing::warn!("Pre-key bundle fetch requires engine integration");
-    anyhow::bail!("Pre-key bundle fetch requires engine integration")
+    tracing::warn!("pre-key bundle fetch is not wired to construct-transport yet");
+    anyhow::bail!("pre-key bundle fetch is not wired to construct-transport yet")
 }
 
 fn build_envelope(
@@ -763,7 +767,7 @@ fn build_envelope(
     message_id: String,
     content_type: ContentType,
 ) -> Envelope {
-    use construct_engine::proto::core::v1::DeviceId;
+    use crate::proto::core::v1::DeviceId;
 
     Envelope {
         sender: Some(UserId {
@@ -877,7 +881,7 @@ const KNST_HEADER_SIZE: usize = 30;
 ///  2. Decodes the protobuf payload to extract `text_message.text`.
 ///  3. Falls back to lossy UTF-8 if no KNST magic or proto decode fails.
 fn decode_plaintext_text(plaintext: &[u8]) -> String {
-    use construct_engine::proto::messaging::v1::MessageContent;
+    use crate::proto::messaging::v1::MessageContent;
 
     // ── Check for KNST frame ──────────────────────────────────────────────────
     if plaintext.len() >= KNST_HEADER_SIZE
@@ -888,9 +892,8 @@ fn decode_plaintext_text(plaintext: &[u8]) -> String {
 
         // Try protobuf decode first
         if let Ok(content) = MessageContent::decode(payload) {
-            if let Some(construct_engine::proto::messaging::v1::message_content::Content::Text(
-                text_msg,
-            )) = content.content
+            if let Some(crate::proto::messaging::v1::message_content::Content::Text(text_msg)) =
+                content.content
             {
                 return text_msg.text;
             }

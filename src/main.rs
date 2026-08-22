@@ -2,13 +2,14 @@ mod app;
 mod auth;
 mod bridge;
 mod config;
-mod engine_adapter;
 mod event;
 mod invite;
 mod orchestrator_task;
+mod proto;
 mod screens;
 mod storage;
 mod streaming;
+mod transport;
 mod tui;
 
 use anyhow::Result;
@@ -82,8 +83,7 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // rustls 0.23+ is installed by construct-engine at startup.
-    // No need to install it here — the engine does it in ConstructEngine::start().
+    // rustls 0.23+ is installed by construct-transport when a QuicClient connects.
 
     let cli = Cli::parse();
 
