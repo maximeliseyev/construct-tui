@@ -1,10 +1,12 @@
 [package]
 name = "construct-tui"
+license = "MPL-2.0"
 version = "0.1.8"
 edition = "2024"
+rust-version = "1.96"
 
 [[bin]]
-name = "konstrukt"
+name = "konstruct"
 path = "src/main.rs"
 
 [features]

@@ -7,9 +7,39 @@ Context for AI agents working in this repository.
 ## What is construct-tui?
 
 Terminal UI client for Construct Messenger. Built with Rust + [Ratatui](https://ratatui.rs).
-Runs on macOS, Linux, Raspberry Pi. Binary name: `konstrukt`.
+Runs on macOS, Linux, Raspberry Pi. Binary name: `konstruct`.
 
-Uses `construct-engine` (not `construct-core` directly) for all crypto and server comms.
+**This client is behind iOS and is not currently a production-usable messenger.**
+`construct-messenger` is the source of truth for how the protocol actually works.
+Do not treat the April 2026 TUI guide as current — it lives in
+`construct-docs/_archive/TUI_DEVELOPMENT_GUIDE.md`.
+
+---
+
+## Current stack (read before changing anything)
+
+Two parallel integration paths exist. Neither is finished.
+
+```
+screens/  →  app.rs
+              ├── orchestrator_task.rs  →  construct-core Orchestrator   ← crypto / sessions
+              ├── engine_adapter.rs     →  construct-engine UiEvent      ← retired 2026-07-28
+              └── streaming.rs          →  dummy loop (not a live stream)
+```
+
+- Crypto decisions belong in `construct-core::orchestration::Orchestrator`.
+  `orchestrator_task.rs` is the platform bridge (storage, timers, UI events).
+- `construct-engine` is **retired**. iOS, macOS, and Android go
+  `construct-core` + `construct-transport` + `construct-veil`. This TUI follows
+  the same path. Do not add `UiEvent` / engine surface; do not spend time making
+  the engine compile against current core.
+- `streaming.rs` is a stub. `fetch_bundle_json` in `orchestrator_task.rs` always
+  errors (`"Pre-key bundle fetch requires engine integration"`).
+- `--bridge` / `--headless` / `--config` are clap flags, not behaviour.
+
+Known compile blockers as of 2026-08-22: stale `Cargo.lock` (`construct-core` 0.8.4
+vs live 0.12.4), leftover `construct-ice` patch, local rustc older than core's
+`rust-version = "1.96"`.
 
 ---
 
@@ -17,57 +47,58 @@ Uses `construct-engine` (not `construct-core` directly) for all crypto and serve
 
 ```
 main.rs
-├── app.rs              — App state, event loop
-├── engine_adapter.rs   — ConstructEngine wrapper (UiEvent dispatch, PlatformAction handler)
-├── bridge.rs           — Bridge between TUI events and engine events
-├── streaming.rs        — gRPC message stream handling
-├── storage.rs          — Local message/session persistence
-├── auth.rs             — Auth flow (registration, login)
-├── invite.rs           — Invite link handling
-├── orchestrator_task.rs — Background engine task
-├── tui.rs              — Terminal setup / teardown
-├── event.rs            — TUI input event types
-└── screens/            — Screen views (chats, chat, settings, login, register…)
+├── app.rs               — App state, event loop
+├── orchestrator_task.rs — construct-core Orchestrator actor (preferred crypto path)
+├── bridge.rs            — PlatformBridge + UI events from the orchestrator
+├── engine_adapter.rs    — leftover ConstructEngine wrapper; do not extend
+├── streaming.rs         — intended gRPC stream; currently a dummy loop
+├── storage.rs           — SQLCipher messages / sessions / acks
+├── auth.rs              — registration / restore (still talks about the engine)
+├── invite.rs            — invite link handling
+├── tui.rs               — terminal setup / teardown
+├── event.rs             — TUI input event types
+├── config/              — ~/.config/construct-tui/  (session.enc, config.json)
+└── screens/             — Ratatui widgets (chats, chat, settings, login, register…)
 ```
 
-### engine_adapter.rs is the integration boundary
-
-All interactions with the Construct protocol go through `EngineAdapter`.
-It wraps `ConstructEngine` and translates TUI app events into `UiEvent`s,
-and `PlatformAction`s back into TUI state updates.
+Screens borrow from `App`. They must not call `construct-engine` or `construct-core`
+internals. Crypto/network work goes through `orchestrator_task` (today) or a future
+transport client — not through widgets.
 
 ---
 
 ## Build & Run
 
-```bash
-cargo build --release              # build — binary at target/release/konstrukt
-cargo run                          # run in dev mode
-cargo test                         # tests
-cargo clippy                       # lint
+Sibling path deps: `../construct-core`, `../construct-engine`.
+Toolchain: stable ≥ 1.96.
 
-# Install locally
-cargo install --path .
+```bash
+cargo build --release              # binary at target/release/konstruct
+cargo run                          # dev mode
+cargo test                         # tests (storage + safety number only)
+cargo clippy --all-targets -- -D warnings
+cargo fmt
 ```
 
-Cross-compilation (for release):
+Cross-compilation (when the crate actually builds):
+
 ```bash
-# Linux x86_64
 cargo build --release --target x86_64-unknown-linux-gnu
-# Linux aarch64 (Raspberry Pi)
 cargo build --release --target aarch64-unknown-linux-gnu
 ```
+
+Default features include `post-quantum`. There is **no** `ice` feature.
 
 ---
 
 ## Key conventions
 
-- All crypto/server operations go through `engine_adapter.rs` — never call `construct-engine` internals directly from screens
-- TUI screens are in `screens/` — each screen is a Ratatui `Widget` impl
-- State lives in `app.rs` `App` struct — screens borrow from it
-- `config/` — user config directory (`~/.config/konstrukt/`)
+- New protocol work follows iOS/`construct-core`, not the engine.
+- TUI screens are in `screens/` — Ratatui `Widget` impls.
+- State lives in `app.rs` `App` — screens borrow from it.
+- User config: `~/.config/construct-tui/` (not `~/.config/konstruct/`).
+- Data: `~/.local/share/construct-tui/` (`messages.db`, `konstruct.log`).
 
----
 ---
 
 ## Documentation & session notes

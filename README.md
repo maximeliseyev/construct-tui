@@ -1,8 +1,10 @@
 # construct-tui
 
-Terminal UI client for [Construct Messenger](https://konstruct.cc) — E2EE messenger with a terminal/ASCII aesthetic.
+Terminal UI client for [Konstruct](https://konstruct.cc) — E2EE messenger with a terminal/ASCII aesthetic.
 
-Built with Rust + [Ratatui](https://ratatui.rs). Runs anywhere: Linux, macOS, Raspberry Pi.
+Built with Rust + [Ratatui](https://ratatui.rs). Target platforms: Linux, macOS, Raspberry Pi. Binary name: `konstruct`.
+
+**Status (2026-08):** early-stage. The crate does not currently build against the live `construct-core` (stale path deps, retired `construct-engine`). The iOS app in `construct-messenger` is the source of truth for protocol behaviour. This repo is being brought back in line.
 
 ```
 ┌─ CONSTRUCT ─────────────────────────────────────────────────────────────────┐
@@ -16,49 +18,7 @@ Built with Rust + [Ratatui](https://ratatui.rs). Runs anywhere: Linux, macOS, Ra
 └────────────────────────────┴────────────────────────────────────────────────┘
 ```
 
----
-
-## Installation
-
-### Pre-built binary (fastest)
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/maximeliseyev/construct-tui/main/scripts/install.sh | sh
-```
-
-Downloads the latest release for your platform (macOS arm64/x86_64, Linux x86_64/aarch64)
-and installs `konstrukt` to `/usr/local/bin`.
-
-**Manual download** from [Releases](https://github.com/maximeliseyev/construct-tui/releases/latest):
-
-| Platform | File |
-|----------|------|
-| macOS (Apple Silicon) | `konstrukt-macos-arm64.tar.gz` |
-| macOS (Intel) | `konstrukt-macos-x86_64.tar.gz` |
-| Linux x86_64 | `konstrukt-linux-x86_64.tar.gz` |
-| Linux aarch64 (RPi 4+) | `konstrukt-linux-aarch64.tar.gz` |
-
-```bash
-# Example — macOS Apple Silicon
-curl -LO https://github.com/maximeliseyev/construct-tui/releases/latest/download/konstrukt-macos-arm64.tar.gz
-tar xzf konstrukt-macos-arm64.tar.gz
-chmod +x konstrukt-macos-arm64
-mv konstrukt-macos-arm64 /usr/local/bin/konstrukt
-```
-
-### Copy binary to another machine
-
-```bash
-# To a remote server or Raspberry Pi
-scp ./target/release/konstrukt pi@raspberrypi.local:/usr/local/bin/konstrukt
-
-# Or via rsync
-rsync -avz ./target/release/konstrukt user@server:/usr/local/bin/konstrukt
-```
-
-### Build from source
-
-See the [Build](#build) section below.
+License: [MPL-2.0](LICENSE). Trademark: [TRADEMARK.md](TRADEMARK.md).
 
 ---
 
@@ -66,14 +26,14 @@ See the [Build](#build) section below.
 
 | Terminal | Support |
 |----------|---------|
-| **WezTerm** | ✅ Recommended — true color, Unicode, ligatures |
-| **Kitty** | ✅ Excellent |
-| **iTerm2** | ✅ Good |
-| **Alacritty** | ✅ Good (no ligatures) |
-| **tmux** | ✅ Works — set `TERM=xterm-256color` or `tmux-256color` |
-| Apple Terminal | ⚠️ 256 colors only, no true color |
+| **WezTerm** | Recommended — true color, Unicode, ligatures |
+| **Kitty** | Excellent |
+| **iTerm2** | Good |
+| **Alacritty** | Good (no ligatures) |
+| **tmux** | Works — set `TERM=xterm-256color` or `tmux-256color` |
+| Apple Terminal | 256 colors only, no true color |
 
-Minimum terminal size: **80×24**. The banner scales down automatically on narrower terminals.
+Minimum terminal size: **80×24**.
 
 ---
 
@@ -81,16 +41,27 @@ Minimum terminal size: **80×24**. The banner scales down automatically on narro
 
 | Dependency | Version |
 |------------|---------|
-| Rust toolchain | stable ≥ 1.85 |
+| Rust toolchain | stable ≥ 1.96 (matches `construct-core`) |
+| Sibling checkouts | `../construct-core` and `../construct-engine` (path deps) |
 | `libsqlcipher` | bundled (no system install needed) |
-| `protoc` (Protocol Buffers compiler) | only if regenerating `.proto` |
 
 ```bash
 # macOS
-brew install rust
+brew install rustup
+rustup toolchain install 1.96.0
 
 # Debian / Ubuntu
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup toolchain install 1.96.0
+```
+
+Layout expected by `Cargo.toml`:
+
+```
+~/Code/
+  construct-tui/       # this repo
+  construct-core/      # crypto
+  construct-engine/    # current path dependency — retired from iOS/Android; see AGENTS.md
 ```
 
 ---
@@ -98,68 +69,68 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ## Build
 
 ```bash
-# Standard release build (direct TLS, no PQ)
 cargo build --release
-
-# With obfs4 DPI-bypass transport (construct-ice)
-cargo build --release --features ice
-
-# Post-quantum (Kyber-768 PQXDH) — for powerful devices (RPi 3B+ and up)
-cargo build --profile release-pq --features post-quantum
-
-# PQ + ICE (everything)
-cargo build --profile release-pq --features post-quantum,ice
+# binary: target/release/konstruct
 ```
 
-The binary is named `konstrukt` and is placed at `target/release/konstrukt`
-(or `target/release-pq/konstrukt` for the PQ build).
+Post-quantum (Kyber-768 PQXDH) is **on by default**. To build without it:
 
-> **Note for Raspberry Pi Zero W:** Kyber-768 handshake takes ~60 s. Use the standard build without `post-quantum`.
+```bash
+cargo build --release --no-default-features
+```
+
+> **Raspberry Pi Zero W:** Kyber-768 handshake can take ~60 s. Use `--no-default-features` on very small boards.
+
+There is no `ice` / obfs4 feature. `construct-ice` was retired in favour of VEIL; the CLI still accepts `--bridge` but it only fills a config label.
+
+Copy a built binary to another machine:
+
+```bash
+scp ./target/release/konstruct pi@raspberrypi.local:/usr/local/bin/konstruct
+```
 
 ---
 
 ## Run
 
 ```bash
-# Defaults — connects to https://konstruct.cc
-konstrukt
+# Defaults — server from ~/.config/construct-tui/config.json,
+# or https://ams.konstruct.cc:443 if the file is missing
+konstruct
 
 # Override server
-konstrukt --server https://ams.konstruct.cc:443
-
-# Enable obfs4 DPI-bypass (requires --features ice build)
-konstrukt --bridge "cert=BASE64... iat-mode=0"
-
-# obfs4 + CDN SNI fronting
-konstrukt --bridge "cert=BASE64... iat-mode=0" --bridge-tls-sni cdn.example.com
+konstruct --server https://ams.konstruct.cc:443
 
 # Disable at-rest encryption (headless / systemd use)
-konstrukt --no-encrypt
-# or via env var:
-CONSTRUCT_NO_ENCRYPT=1 konstrukt
+konstruct --no-encrypt
+# or:
+CONSTRUCT_NO_ENCRYPT=1 konstruct
 
-# Post-quantum mode (binary must be built with --features post-quantum)
-konstrukt --post-quantum
+# Log level: error, warn, info, debug, trace (default: info).
+# Logs: ~/.local/share/construct-tui/konstruct.log
+# RUST_LOG overrides --log-level when set.
+konstruct --log-level debug
 
-# Headless daemon (receive messages without a terminal UI)
-konstrukt --headless
-
-# Custom config file
-konstrukt --config /etc/construct/config.json
+# Print log path and exit
+konstruct log-path
 
 # Delete local session and all keys
-konstrukt logout
+konstruct logout
 ```
+
+`--bridge` / `--bridge-tls-sni`, `--headless`, and `--config` are parsed by clap but **not wired** — they do not change transport, skip the TUI, or load a custom config file.
 
 ---
 
 ## First run
 
 1. **Register** — enter a username. The client generates Ed25519 + X25519 keys locally, solves a proof-of-work challenge, and registers the device with the server.
-2. **Set passphrase** — protects your session and message database with Argon2id + AES-256-GCM at rest. Leave empty to skip encryption (use `--no-encrypt` or `CONSTRUCT_NO_ENCRYPT`).
-3. **Chat** — you're in.
+2. **Set passphrase** — protects the session file and message database with Argon2id + AES-256-GCM at rest. Leave empty to skip encryption (or pass `--no-encrypt`).
+3. **Chat** — main screen.
 
-On subsequent runs the session is loaded from disk and decrypted with your passphrase.
+On subsequent runs the session is loaded from disk and decrypted with the passphrase.
+
+End-to-end messaging against the live server / iOS client is **not yet working** (message stream is a stub; pre-key bundle fetch is unimplemented).
 
 ---
 
@@ -205,25 +176,14 @@ Stored at `~/.config/construct-tui/config.json`. Created automatically on first 
 
 ```json
 {
-  "server": "https://ams.konstruct.cc",
+  "server": "https://ams.konstruct.cc:443",
   "transport": {
     "mode": "Direct"
   }
 }
 ```
 
-**Transport modes:**
-
-```json
-// Direct TLS (default)
-{ "mode": "Direct" }
-
-// obfs4 obfuscation
-{ "mode": "Obfs4", "bridge_line": "cert=BASE64... iat-mode=0" }
-
-// obfs4 + SNI fronting
-{ "mode": "Obfs4Tls", "bridge_line": "cert=BASE64...", "tls_server_name": "cdn.example.com" }
-```
+Only `Direct` is used. Other `mode` values (`Obfs4`, `Obfs4Tls`, `CdnFront`) are stored and shown in settings; they do not select a transport.
 
 ---
 
@@ -234,12 +194,16 @@ Stored at `~/.config/construct-tui/config.json`. Created automatically on first 
 | `~/.config/construct-tui/session.enc` | Encrypted session (keys + tokens). Argon2id + AES-256-GCM. |
 | `~/.config/construct-tui/config.json` | Server URL + transport config (plaintext). |
 | `~/.local/share/construct-tui/messages.db` | SQLCipher-encrypted message database. |
+| `~/.local/share/construct-tui/konstruct.log` | Application log. |
+
+Argon2id parameters: 32 MiB memory, 3 iterations, 1 thread (tuned for Raspberry Pi 4). The DB key is derived from the same master key via HKDF.
 
 **Deleting everything:**
+
 ```bash
 rm -rf ~/.config/construct-tui ~/.local/share/construct-tui
-# or use the built-in subcommand:
-konstrukt logout
+# or:
+konstruct logout
 ```
 
 ---
@@ -247,228 +211,28 @@ konstrukt logout
 ## Development
 
 ```bash
-# Debug build + run
 cargo run
-
-# With ICE transport
-cargo run --features ice
-
-# Run tests
 cargo test
-
-# Lint
 cargo clippy --all-targets -- -D warnings
-
-# Format
 cargo fmt
-
-# Install git pre-commit hooks (fmt + clippy)
-bash scripts/install-hooks.sh
+bash scripts/install-hooks.sh    # pre-commit: fmt + clippy
 ```
+
+There is no CI in this repo (removed 2026-06-19; the project was too early-stage to build in GitHub Actions).
 
 ---
 
 ## Security notes
 
 - **Keys never leave the device** — the server only stores public keys.
-- **Session file** is encrypted with Argon2id (64 MiB memory, 3 iterations) + AES-256-GCM. The Argon2id salt is stored alongside the ciphertext.
-- **Messages** are stored in a SQLCipher AES-256 encrypted database. The DB key is derived from the same Argon2id master key via HKDF.
-- **Signal Protocol** (X3DH + Double Ratchet) + optional **PQXDH** (Kyber-768) for post-quantum forward secrecy.
-- **construct-ice** (obfs4-based) transport hides traffic from DPI — useful on censored networks.
+- **Session file** is encrypted with Argon2id + AES-256-GCM. The Argon2id salt is stored alongside the ciphertext.
+- **Messages** are stored in a SQLCipher AES-256 encrypted database.
+- **Signal Protocol** (X3DH + Double Ratchet) + **PQXDH** (Kyber-768) when built with default features.
 
+DPI-bypass (VEIL) is **not** integrated here. iOS/Android use `construct-veil` via `construct-core`; this client still points at the retired `construct-engine`.
 
-| Dependency | Version |
-|------------|---------|
-| Rust toolchain | stable ≥ 1.85 |
-| `libsqlcipher` | bundled (no system install needed) |
-| `protoc` (Protocol Buffers compiler) | only if regenerating `.proto` |
+## Trademark
 
-```bash
-# macOS
-brew install rust
-
-# Debian / Ubuntu
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
----
-
-## Build
-
-```bash
-# Standard release build (direct TLS, no PQ)
-cargo build --release
-
-# With obfs4 DPI-bypass transport (construct-ice)
-cargo build --release --features ice
-
-# Post-quantum (Kyber-768 PQXDH) — for powerful devices (RPi 3B+ and up)
-cargo build --profile release-pq --features post-quantum
-
-# PQ + ICE (everything)
-cargo build --profile release-pq --features post-quantum,ice
-```
-
-The binary is at `target/release/construct-tui` (or `target/release-pq/construct-tui` for the PQ build).
-
-> **Note for Raspberry Pi Zero W:** Kyber-768 handshake takes ~60 s. Use the standard build without `post-quantum`.
-
----
-
-## Run
-
-```bash
-# Defaults — connects to https://construct.cc
-./construct-tui
-
-# Override server
-./construct-tui --server https://ams.konstruct.cc:443
-
-# Enable obfs4 DPI-bypass (requires --features ice build)
-./construct-tui --bridge "cert=BASE64... iat-mode=0"
-
-# obfs4 + CDN SNI fronting
-./construct-tui --bridge "cert=BASE64... iat-mode=0" --bridge-tls-sni cdn.example.com
-
-# Disable at-rest encryption (headless / systemd use)
-./construct-tui --no-encrypt
-# or via env var:
-CONSTRUCT_NO_ENCRYPT=1 ./construct-tui
-
-# Post-quantum mode (binary must be built with --features post-quantum)
-./construct-tui --post-quantum
-
-# Headless daemon (receive messages without a terminal UI)
-./construct-tui --headless
-
-# Custom config file
-./construct-tui --config /etc/construct/config.json
-
-# Delete local session and all keys
-./construct-tui logout
-```
-
----
-
-## First run
-
-1. **Register** — enter a username. The client generates Ed25519 + X25519 keys locally, solves a proof-of-work challenge, and registers the device with the server.
-2. **Set passphrase** — protects your session and message database with Argon2id + AES-256-GCM at rest. Leave empty to skip encryption (use `--no-encrypt` or `CONSTRUCT_NO_ENCRYPT`).
-3. **Chat** — you're in.
-
-On subsequent runs the session is loaded from disk and decrypted with your passphrase.
-
----
-
-## Key bindings
-
-### Main screen
-
-| Key | Action |
-|-----|--------|
-| `↑` / `↓` | Navigate contact list |
-| `Enter` | Open conversation |
-| `Tab` / `i` | Focus compose box |
-| `Esc` | Back to contact list |
-| `Shift+Tab` | Focus contact list from compose |
-| `Enter` (in compose) | Send message |
-| `s` | Open settings |
-| `a` | Add contact (search) |
-| `q` | Quit (when compose is not focused) |
-| `Ctrl+C` | Force quit (any screen) |
-
-### Settings screen
-
-| Key | Action |
-|-----|--------|
-| `↑` / `↓` | Navigate |
-| `Enter` | Select / confirm |
-| `Esc` / `q` | Back to chat |
-
-### Add contact (search overlay)
-
-| Key | Action |
-|-----|--------|
-| Type | Search by username |
-| `↑` / `↓` | Navigate results |
-| `Ctrl+A` | Add selected contact |
-| `Esc` | Close |
-
----
-
-## Config file
-
-Stored at `~/.config/construct-tui/config.json`. Created automatically on first run.
-
-```json
-{
-  "server": "https://konstruct.cc",
-  "transport": {
-    "mode": "Direct"
-  }
-}
-```
-
-**Transport modes:**
-
-```json
-// Direct TLS (default)
-{ "mode": "Direct" }
-
-// obfs4 obfuscation
-{ "mode": "Obfs4", "bridge_line": "cert=BASE64... iat-mode=0" }
-
-// obfs4 + SNI fronting
-{ "mode": "Obfs4Tls", "bridge_line": "cert=BASE64...", "tls_server_name": "cdn.example.com" }
-```
-
----
-
-## Data storage
-
-| File | Contents |
-|------|----------|
-| `~/.config/construct-tui/session.enc` | Encrypted session (keys + tokens). Argon2id + AES-256-GCM. |
-| `~/.config/construct-tui/config.json` | Server URL + transport config (plaintext). |
-| `~/.local/share/construct-tui/messages.db` | SQLCipher-encrypted message database. |
-
-**Deleting everything:**
-```bash
-rm -rf ~/.config/construct-tui ~/.local/share/construct-tui
-# or use the built-in subcommand:
-./construct-tui logout
-```
-
----
-
-## Development
-
-```bash
-# Debug build + run
-cargo run
-
-# With ICE transport
-cargo run --features ice
-
-# Run tests
-cargo test
-
-# Lint
-cargo clippy --all-targets -- -D warnings
-
-# Format
-cargo fmt
-
-# Install git pre-commit hooks (fmt + clippy)
-bash scripts/install-hooks.sh
-```
-
----
-
-## Security notes
-
-- **Keys never leave the device** — the server only stores public keys.
-- **Session file** is encrypted with Argon2id (64 MiB memory, 3 iterations) + AES-256-GCM. The Argon2id salt is stored alongside the ciphertext.
-- **Messages** are stored in a SQLCipher AES-256 encrypted database. The DB key is derived from the same Argon2id master key via HKDF.
-- **Signal Protocol** (X3DH + Double Ratchet) + optional **PQXDH** (Kyber-768) for post-quantum forward secrecy.
-- **construct-ice** (obfs4-based) transport hides traffic from DPI — useful on censored networks.
+**Konstruct™** / **Конструкт™** and the logo are trademarks of Maxim Eliseyev. The open-source
+license on this code does **not** grant trademark rights — see [TRADEMARK.md](TRADEMARK.md).
+Forks that distribute a modified version must rebrand.

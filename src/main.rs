@@ -63,7 +63,7 @@ struct Cli {
     post_quantum: bool,
 
     /// Log level: error, warn, info, debug, trace (default: info).
-    /// Logs are written to ~/.local/share/construct-tui/konstrukt.log.
+    /// Logs are written to ~/.local/share/construct-tui/konstruct.log.
     /// Also respects the RUST_LOG environment variable.
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -129,7 +129,7 @@ async fn main() -> Result<()> {
     tracing::info!(
         log_file = %log_path.display(),
         version = env!("CARGO_PKG_VERSION"),
-        "konstrukt starting"
+        "konstruct starting"
     );
 
     // --post-quantum: verify the feature is compiled in; show a helpful error if not.
@@ -184,7 +184,7 @@ async fn main() -> Result<()> {
     let result = App::new(cfg).run(&mut terminal).await;
     tui::restore()?;
 
-    tracing::info!("konstrukt exiting");
+    tracing::info!("konstruct exiting");
     result
 }
 
@@ -192,5 +192,5 @@ fn log_file_path() -> std::path::PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("construct-tui")
-        .join("konstrukt.log")
+        .join("konstruct.log")
 }
