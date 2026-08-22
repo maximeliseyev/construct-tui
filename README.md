@@ -7,7 +7,7 @@ Built with Rust + [Ratatui](https://ratatui.rs). Target platforms: Linux, macOS,
 **Status (2026-08):** early-stage. The crate does not currently build against the live `construct-core` (stale path deps, retired `construct-engine`). The iOS app in `construct-messenger` is the source of truth for protocol behaviour. This repo is being brought back in line.
 
 ```
-┌─ CONSTRUCT ─────────────────────────────────────────────────────────────────┐
+┌─ KONSTRUCT ─────────────────────────────────────────────────────────────────┐
 │ > CONTACTS                 │ [alice]  15:42                                 │
 │   alice           15:42    │ hey, got the new build running                 │
 │   bob             14:11    │                                                │
@@ -26,8 +26,8 @@ License: [MPL-2.0](LICENSE). Trademark: [TRADEMARK.md](TRADEMARK.md).
 
 | Terminal | Support |
 |----------|---------|
-| **WezTerm** | Recommended — true color, Unicode, ligatures |
-| **Kitty** | Excellent |
+| **[WezTerm](https://wezterm.org)** | Recommended — true color, Unicode, ligatures |
+| **[Kitty](https://github.com/kovidgoyal/kitty)** | Excellent |
 | **iTerm2** | Good |
 | **Alacritty** | Good (no ligatures) |
 | **tmux** | Works — set `TERM=xterm-256color` or `tmux-256color` |
@@ -167,23 +167,6 @@ gRPC (register, authenticate, device link, token refresh, pre-key bundle, FindUs
 | `↑` / `↓` | Navigate results |
 | `Ctrl+A` | Add selected contact |
 | `Esc` | Close |
-
----
-
-## Config file
-
-Stored at `~/.config/construct-tui/config.json`. Created automatically on first run.
-
-```json
-{
-  "server": "https://ams.konstruct.cc:443",
-  "transport": {
-    "mode": "Direct"
-  }
-}
-```
-
-Only `Direct` is used. Other `mode` values (`Obfs4`, `Obfs4Tls`, `CdnFront`) are stored and shown in settings; they do not select a transport.
 
 ---
 
