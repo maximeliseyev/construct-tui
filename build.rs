@@ -41,4 +41,17 @@ fn compile_protos() {
         &[protos_dir.as_str()],
     )
     .unwrap_or_else(|e| panic!("proto compilation failed: {e}"));
+
+    // Exported so `knst.rs` can `include_str!` the conformance vectors that live beside the
+    // protos. They are the authority for what a content type means to a client, and a test
+    // that cannot read them is a test that agrees with itself.
+    //
+    // Absolute: `include_str!` resolves a relative path against the *source file's* directory,
+    // so the default `../construct-protos` would be looked up from `src/` and miss.
+    let protos_abs = protos_path
+        .canonicalize()
+        .unwrap_or_else(|e| panic!("cannot resolve '{protos_dir}': {e}"));
+    let protos_abs = protos_abs.display();
+    println!("cargo:rustc-env=CONSTRUCT_PROTOS_DIR={protos_abs}");
+    println!("cargo:rerun-if-changed={protos_abs}/conformance/knst_content_types.json");
 }

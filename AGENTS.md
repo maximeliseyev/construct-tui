@@ -68,6 +68,18 @@ screens/  →  app.rs
               └── grpc/                 →  gRPC-over-H2 (system-root TLS; ams.konstruct.cc)
 ```
 
+- **This client does not decide what a content type means.** It is the second implementation of
+  the protocol, and the first comparison against iOS found the two already diverged: iOS held
+  `{12,14,21,23,24,25,26}` as control, `knst::is_silent_type` held `{12,13,14,25,26}`. Both were
+  defensible — they answered different questions nobody had written down — and nothing failed,
+  because a divergence here is a payload that is a bubble on one client and nothing on the other.
+  - Values come from the generated enum: `ContentType::SessionPing as u8`, never `= 25`.
+  - What to do with a value is `construct-protos/conformance/knst_content_types.json`, read by
+    `knst::tests::content_type_vectors_match_this_table`. `build.rs` exports
+    `CONSTRUCT_PROTOS_DIR` so the test can `include_str!` it.
+  - **Adding a content type means adding its row there in the same change.** A type this client
+    has not learned then reddens that test on the next build.
+  - `decisions/wire-format-one-authority.md` before touching `disposition()` or the constants.
 - **`construct-engine` does not come back.** Retired from messenger 2026-07-28, dropped from
   this crate 2026-08-22. No `EngineAdapter`, no `UiEvent`/`PlatformAction` façade. See
   `decisions/macos-desktop-strategy.md` — the 2026-06-16 trigger "engine returns if a TUI
