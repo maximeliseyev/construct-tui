@@ -1,10 +1,9 @@
 # construct-tui
 
-Terminal UI client for [Konstruct](https://konstruct.cc) — E2EE messenger with a terminal/ASCII aesthetic.
+Terminal UI client for [Konstruct](https://konstruct.cc) — Privacy-First Secure Messenger with Post-Quantum Encryption.
 
-Built with Rust + [Ratatui](https://ratatui.rs). Target platforms: Linux, macOS, Raspberry Pi. Binary name: `konstruct`.
+Built with Rust + [Ratatui](https://ratatui.rs). Target platforms: Linux, macOS. Binary name: `konstruct`.
 
-**Status (2026-08):** early-stage. The crate does not currently build against the live `construct-core` (stale path deps, retired `construct-engine`). The iOS app in `construct-messenger` is the source of truth for protocol behaviour. This repo is being brought back in line.
 
 ```
 ┌─ KONSTRUCT ─────────────────────────────────────────────────────────────────┐
