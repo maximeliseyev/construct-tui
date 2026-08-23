@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 
 use crate::config::{Session, load_session, save_session};
+use crate::grpc::GrpcClient;
 
 /// Each step of registration, sent to the UI as it progresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,12 +62,12 @@ pub struct AuthResult {
 
 /// Try to authenticate using a saved session.
 /// Returns `None` if no session file exists.
-pub async fn try_restore_session(server_url: &str) -> Result<Option<AuthResult>> {
+pub async fn try_restore_session(client: &GrpcClient) -> Result<Option<AuthResult>> {
     let Some(session) = load_session()? else {
         return Ok(None);
     };
 
-    let result = authenticate_saved_session(session.clone(), server_url).await?;
+    let result = authenticate_saved_session(session.clone(), client).await?;
 
     // Refresh stored tokens
     let mut updated = session.clone();
@@ -89,7 +90,7 @@ pub async fn try_restore_session(server_url: &str) -> Result<Option<AuthResult>>
 /// `username` is optional (display name hint sent to the server).
 /// `progress_tx` receives step updates for the UI checklist; send errors are silently ignored.
 pub async fn register_new_device(
-    server_url: &str,
+    client: &GrpcClient,
     username: Option<&str>,
     progress_tx: &mpsc::UnboundedSender<RegistrationStep>,
 ) -> Result<AuthResult> {
@@ -149,20 +150,22 @@ pub async fn register_new_device(
 
     step(RegistrationStep::SolvingPoW);
 
-    let client = crate::grpc::GrpcClient::connect(server_url)
-        .await
-        .context("grpc connect")?;
-    client.set_device_id(Some(device_id.clone())).await;
-    let (challenge, difficulty) = crate::grpc::get_pow_challenge(&client)
+    client.set_device_id(Some(device_id.clone()));
+    let (challenge, difficulty) = crate::grpc::get_pow_challenge(client)
         .await
         .context("pow challenge")?;
 
+    tracing::info!(
+        difficulty,
+        "solving PoW (Argon2id, may take minutes at difficulty 8)"
+    );
     let challenge_for_pow = challenge.clone();
     let solution = tokio::task::spawn_blocking(move || {
         construct_core::pow::compute_pow(&challenge_for_pow, difficulty)
     })
     .await
     .context("PoW computation panicked")?;
+    tracing::info!(nonce = solution.nonce, "PoW solved");
 
     step(RegistrationStep::Registering);
     sleep(Duration::from_millis(MIN_STEP_MS)).await;
@@ -174,7 +177,7 @@ pub async fn register_new_device(
         &spk_sig.to_bytes(),
     );
     let tokens = crate::grpc::register_device(
-        &client,
+        client,
         username.map(str::to_string),
         &device_id,
         pubs,
@@ -214,7 +217,7 @@ pub async fn register_new_device(
 /// generated on another device (iOS/Desktop Settings → Add Device).
 ///
 /// Generates fresh device keys, then calls `ConfirmDeviceLink` with the token.
-pub async fn link_existing_device(server_url: &str, link_token: &str) -> Result<AuthResult> {
+pub async fn link_existing_device(client: &GrpcClient, link_token: &str) -> Result<AuthResult> {
     // 1. Generate fresh device keys (same as register_new_device)
     let signing_pair = Ed25519KeyPair::generate();
     let identity_pair = X25519KeyPair::generate();
@@ -250,17 +253,14 @@ pub async fn link_existing_device(server_url: &str, link_token: &str) -> Result<
         &private_keys,
     )?;
 
-    let client = crate::grpc::GrpcClient::connect(server_url)
-        .await
-        .context("grpc connect")?;
-    client.set_device_id(Some(device_id.clone())).await;
+    client.set_device_id(Some(device_id.clone()));
     let pubs = crate::grpc::device_public_keys(
         &signing_pair.public_key,
         &identity_pair.public_key,
         &spk_pair.public_key,
         &spk_sig.to_bytes(),
     );
-    let tokens = crate::grpc::confirm_device_link(&client, link_token, &device_id, pubs)
+    let tokens = crate::grpc::confirm_device_link(client, link_token, &device_id, pubs)
         .await
         .context("confirm device link")?;
     let user_id = tokens.user_id;
@@ -293,7 +293,10 @@ pub async fn link_existing_device(server_url: &str, link_token: &str) -> Result<
 /// Authenticate using a session that was already loaded from disk (e.g. after decryption).
 /// Unlike `try_restore_session`, this does NOT touch the session file — the caller is
 /// responsible for re-saving the session with updated tokens.
-pub async fn authenticate_saved_session(session: Session, server_url: &str) -> Result<AuthResult> {
+pub async fn authenticate_saved_session(
+    session: Session,
+    client: &GrpcClient,
+) -> Result<AuthResult> {
     // Parse signing key
     let sk_bytes = hex::decode(&session.signing_key_hex).context("invalid signing key hex")?;
     let sk_array: [u8; 32] = sk_bytes
@@ -309,12 +312,9 @@ pub async fn authenticate_saved_session(session: Session, server_url: &str) -> R
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_array);
     let signature = signing_key.sign(message.as_bytes());
 
-    let client = crate::grpc::GrpcClient::connect(server_url)
-        .await
-        .context("grpc connect")?;
-    client.set_device_id(Some(session.device_id.clone())).await;
+    client.set_device_id(Some(session.device_id.clone()));
     let tokens = crate::grpc::authenticate_device(
-        &client,
+        client,
         &session.device_id,
         timestamp,
         &signature.to_bytes(),

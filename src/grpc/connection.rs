@@ -1,86 +1,86 @@
-//! QUIC endpoint with system-root TLS.
+//! TCP + TLS + HTTP/2 with system-root certificates.
 //!
-//! Ported from construct-engine `transport/connection.rs`. construct-transport's
-//! `QuicClient` pins a gateway cert (iOS); desktop/TUI talks to the public
-//! hostname with the platform trust store.
+//! `ams.konstruct.cc:443` is Caddy HTTP/2 (the iOS production path). QUIC/H3
+//! lives on `quic.konstruct.cc` behind a pinned gateway cert and is not used
+//! here — a handshake to the public hostname over UDP times out.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use quinn::{ClientConfig, Endpoint};
 use rustls::RootCertStore;
+use rustls::pki_types::ServerName;
+use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 use tracing::{debug, info, warn};
 
 use super::error::GrpcError;
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
-pub struct QuicConnection {
-    endpoint: Endpoint,
-    server_name: String,
-    server_addr: std::net::SocketAddr,
+pub struct H2Session {
+    pub send_request: h2::client::SendRequest<bytes::Bytes>,
+    pub driver: tokio::task::JoinHandle<()>,
 }
 
-impl QuicConnection {
-    pub async fn new(host: &str, port: u16, verify_certs: bool) -> Result<Self, GrpcError> {
-        let tls = build_tls_config(verify_certs)?;
-        let client_config = ClientConfig::new(Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(tls)
-                .map_err(|e| GrpcError::tls(format!("QuicClientConfig: {e}")))?,
-        ));
-
-        let mut endpoint = Endpoint::client("[::]:0".parse().unwrap())
-            .or_else(|ipv6_err| {
-                warn!("IPv6 bind failed ({ipv6_err}), falling back to IPv4");
-                Endpoint::client("0.0.0.0:0".parse().unwrap())
-            })
-            .map_err(|e| GrpcError::transport(format!("endpoint bind: {e}")))?;
-        endpoint.set_default_client_config(client_config);
-
-        let server_addr = resolve_addr(host, port).await?;
-        info!(host, addr = %server_addr, "quic endpoint ready");
-
-        Ok(Self {
-            endpoint,
-            server_name: host.to_string(),
-            server_addr,
-        })
-    }
-
-    pub async fn connect(&self) -> Result<quinn::Connection, GrpcError> {
-        debug!(addr = %self.server_addr, "opening QUIC connection");
-        let connect_fut = self
-            .endpoint
-            .connect(self.server_addr, &self.server_name)
-            .map_err(|e| GrpcError::transport(format!("connect: {e}")))?;
-        let conn = tokio::time::timeout(HANDSHAKE_TIMEOUT, connect_fut)
-            .await
-            .map_err(|_| GrpcError::transport("handshake timed out"))?
-            .map_err(|e| GrpcError::transport(format!("handshake: {e}")))?;
-        info!(rtt = ?conn.rtt(), "QUIC handshake complete");
-        Ok(conn)
+impl Drop for H2Session {
+    fn drop(&mut self) {
+        self.driver.abort();
     }
 }
 
-fn build_tls_config(verify_certs: bool) -> Result<rustls::ClientConfig, GrpcError> {
-    let mut root_store = RootCertStore::empty();
-    if verify_certs {
-        let native = rustls_native_certs::load_native_certs()
-            .map_err(|e| GrpcError::tls(format!("native certs: {e}")))?;
-        for cert in native {
-            root_store
-                .add(cert)
-                .map_err(|e| GrpcError::tls(format!("add cert: {e}")))?;
+pub async fn connect_h2(host: &str, port: u16) -> Result<H2Session, GrpcError> {
+    let tls = build_tls_config()?;
+    let server_name = ServerName::try_from(host.to_string())
+        .map_err(|e| GrpcError::tls(format!("server name '{host}': {e}")))?;
+
+    let addr = resolve_addr(host, port).await?;
+    info!(host, %addr, "h2 connecting");
+
+    let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| GrpcError::transport(format!("TCP connect to {addr} timed out")))?
+        .map_err(|e| GrpcError::transport(format!("TCP connect {addr}: {e}")))?;
+    let _ = tcp.set_nodelay(true);
+
+    let connector = TlsConnector::from(Arc::new(tls));
+    let tls_stream = tokio::time::timeout(CONNECT_TIMEOUT, connector.connect(server_name, tcp))
+        .await
+        .map_err(|_| GrpcError::tls("TLS handshake timed out"))?
+        .map_err(|e| GrpcError::tls(format!("TLS handshake: {e}")))?;
+
+    let (send_request, conn) = h2::client::Builder::new()
+        .initial_window_size(1024 * 1024)
+        .initial_connection_window_size(1024 * 1024)
+        .handshake(tls_stream)
+        .await
+        .map_err(|e| GrpcError::transport(format!("h2 handshake: {e}")))?;
+
+    let driver = tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            warn!("h2 connection closed: {e}");
         }
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    } else {
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    });
+
+    debug!(host, "h2 session ready");
+    Ok(H2Session {
+        send_request,
+        driver,
+    })
+}
+
+fn build_tls_config() -> Result<rustls::ClientConfig, GrpcError> {
+    let mut root_store = RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs()
+        .map_err(|e| GrpcError::tls(format!("native certs: {e}")))?;
+    for cert in native {
+        let _ = root_store.add(cert);
     }
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
     let mut tls = rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth();
-    tls.alpn_protocols = vec![b"h3".to_vec()];
+    tls.alpn_protocols = vec![b"h2".to_vec()];
     Ok(tls)
 }
 

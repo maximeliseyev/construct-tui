@@ -159,6 +159,24 @@ impl Storage {
         Ok(())
     }
 
+    /// Inbound path: ignore replays so a server rewind cannot clobber plaintext.
+    pub fn store_inbound_message(&self, msg: &StoredMessage) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO messages
+             (id, peer_id, text, direction, timestamp_ms, delivery_status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                msg.id,
+                msg.peer_id,
+                msg.text,
+                msg.direction,
+                msg.timestamp_ms,
+                msg.delivery_status
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Load up to `limit` most recent messages for a conversation.
     pub fn get_messages(&self, peer_id: &str, limit: usize) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare(
@@ -317,6 +335,42 @@ impl Storage {
         Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
     }
 
+    pub fn secure_delete(&self, key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM secure_store WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
+    // ── Stream cursor (Redis stream id, advanced only after durable persist) ──
+
+    const STREAM_CURSOR_KEY: &'static str = "stream_cursor";
+
+    pub fn load_stream_cursor(&self) -> Result<Option<String>> {
+        Ok(self
+            .secure_load(Self::STREAM_CURSOR_KEY)?
+            .and_then(|b| String::from_utf8(b).ok())
+            .filter(|s| !s.is_empty()))
+    }
+
+    /// Persist `cursor` only if it is strictly after the stored value.
+    /// Returns whether the stored watermark moved.
+    pub fn save_stream_cursor(&self, cursor: &str) -> Result<bool> {
+        if cursor.is_empty() {
+            return Ok(false);
+        }
+        if let Some(old) = self.load_stream_cursor()?
+            && !cursor_after(cursor, &old)
+        {
+            return Ok(false);
+        }
+        self.secure_save(Self::STREAM_CURSOR_KEY, cursor.as_bytes())?;
+        Ok(true)
+    }
+
+    pub fn clear_stream_cursor(&self) -> Result<()> {
+        self.secure_delete(Self::STREAM_CURSOR_KEY)
+    }
+
     // ── Generic record store ──────────────────────────────────────────────────
 
     pub fn persist_record(&self, table_name: &str, json: &str) -> Result<()> {
@@ -338,6 +392,19 @@ impl Storage {
 }
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
+
+/// Redis stream ids are `<millis>-<seq>`. True when `new` is strictly after `old`.
+pub fn cursor_after(new: &str, old: &str) -> bool {
+    match (parse_stream_cursor(new), parse_stream_cursor(old)) {
+        (Some(a), Some(b)) => a > b,
+        _ => new > old,
+    }
+}
+
+fn parse_stream_cursor(s: &str) -> Option<(u64, u64)> {
+    let (ms, seq) = s.split_once('-')?;
+    Some((ms.parse().ok()?, seq.parse().ok()?))
+}
 
 fn db_path() -> Result<PathBuf> {
     let base = dirs::data_local_dir().context("cannot locate data dir")?;
@@ -394,5 +461,45 @@ mod tests {
         s.secure_save("session_key", b"secret").unwrap();
         let val = s.secure_load("session_key").unwrap();
         assert_eq!(val.as_deref(), Some(b"secret".as_ref()));
+    }
+
+    #[test]
+    fn inbound_replay_does_not_clobber() {
+        let s = Storage::open_in_memory().unwrap();
+        let first = StoredMessage {
+            id: "msg-1".into(),
+            peer_id: "alice".into(),
+            text: "hello".into(),
+            direction: "received".into(),
+            timestamp_ms: 1,
+            delivery_status: "".into(),
+        };
+        s.store_inbound_message(&first).unwrap();
+        let replay = StoredMessage {
+            text: "clobber".into(),
+            ..first.clone()
+        };
+        s.store_inbound_message(&replay).unwrap();
+        let msgs = s.get_messages("alice", 10).unwrap();
+        assert_eq!(msgs[0].text, "hello");
+    }
+
+    #[test]
+    fn stream_cursor_refuses_to_go_backwards() {
+        let s = Storage::open_in_memory().unwrap();
+        assert!(s.save_stream_cursor("100-0").unwrap());
+        assert!(!s.save_stream_cursor("99-0").unwrap());
+        assert!(!s.save_stream_cursor("100-0").unwrap());
+        assert!(s.save_stream_cursor("100-1").unwrap());
+        assert_eq!(s.load_stream_cursor().unwrap().as_deref(), Some("100-1"));
+        s.clear_stream_cursor().unwrap();
+        assert!(s.load_stream_cursor().unwrap().is_none());
+    }
+
+    #[test]
+    fn cursor_after_parses_redis_ids() {
+        assert!(cursor_after("1785830217320-0", "1785829024441-0"));
+        assert!(!cursor_after("10-0", "10-0"));
+        assert!(cursor_after("10-1", "10-0"));
     }
 }

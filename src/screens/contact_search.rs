@@ -46,11 +46,15 @@ impl ContactSearchScreen {
 
     pub fn push_char(&mut self, c: char) {
         self.query.push(c);
+        self.results.clear();
+        self.state.select(None);
         self.status = None;
     }
 
     pub fn pop_char(&mut self) {
         self.query.pop();
+        self.results.clear();
+        self.state.select(None);
         self.status = None;
     }
 
@@ -80,7 +84,8 @@ impl ContactSearchScreen {
             self.is_error = false;
         } else {
             self.state.select(Some(0));
-            self.status = None;
+            self.status = Some("Enter = add to chats".into());
+            self.is_error = false;
         }
         self.searching = false;
     }
@@ -120,7 +125,7 @@ impl Widget for &mut ContactSearchScreen {
 
         // Hint
         Paragraph::new(Line::from(Span::styled(
-            "  Enter username  Enter=search  Tab=select  Ctrl+A=add  Esc=back",
+            "  name or paste invite link  Enter  Esc=back",
             Style::default().fg(Color::DarkGray),
         )))
         .render(chunks[0], buf);

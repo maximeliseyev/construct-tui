@@ -16,6 +16,7 @@ use crate::{
     bridge::{BridgeEvent, TokenRefreshMsg},
     config::{self, Session, SessionKey, SessionState, TransportConfig},
     event::{Event, EventHandler, is_quit},
+    grpc::GrpcClient,
     screens::onboarding::OnboardingField,
     screens::{
         ChatListPane, ChatViewPane, ConnectionState, ContactSearchScreen, DeviceLinkScreen,
@@ -92,10 +93,17 @@ pub(crate) enum InternalEvent {
     ContactSearchResult(Vec<SearchResult>),
     /// gRPC search failed.
     ContactSearchError(String),
+    /// Invite link redeemed — add this person.
+    InviteAccepted {
+        user_id: String,
+        username: String,
+    },
     /// Registration step completed — advance the checklist.
     RegistrationStep(RegistrationStep),
     /// Periodic tick for spinner animation on the registration screen.
     Tick,
+    /// MessageStream got gRPC 16 — refresh the bearer, do not wipe keys.
+    StreamAuthRequired,
     /// P2P connection status update.
     P2PStatus {
         peer_id: String,
@@ -146,6 +154,7 @@ pub struct App {
     internal_tx: mpsc::UnboundedSender<InternalEvent>,
     internal_rx: mpsc::UnboundedReceiver<InternalEvent>,
     server_url: String,
+    grpc: GrpcClient,
     transport: TransportConfig,
     /// Authenticated user ID (set after successful auth).
     user_id: String,
@@ -212,7 +221,8 @@ impl App {
             running: true,
             internal_tx,
             internal_rx,
-            server_url: cfg.server_url,
+            server_url: cfg.server_url.clone(),
+            grpc: GrpcClient::new(&cfg.server_url),
             transport: cfg.transport,
             user_id: String::new(),
             pq_active: cfg.pq_active,
@@ -268,9 +278,9 @@ impl App {
     /// Restore a plaintext session from disk (legacy / `--no-encrypt` path).
     fn start_auth_restore_from_disk(&mut self) {
         let tx = self.internal_tx.clone();
-        let url = self.server_url.clone();
+        let grpc = self.grpc.clone();
         tokio::spawn(async move {
-            match crate::auth::try_restore_session(&url).await {
+            match crate::auth::try_restore_session(&grpc).await {
                 Ok(Some(result)) => {
                     let full = result
                         .session
@@ -299,10 +309,10 @@ impl App {
     /// Authenticate using a session already decrypted in memory (after Unlock screen).
     fn start_auth_restore_preloaded(&mut self, session: Session) {
         let tx = self.internal_tx.clone();
-        let server_url = self.server_url.clone();
+        let grpc = self.grpc.clone();
 
         tokio::spawn(async move {
-            match crate::auth::authenticate_saved_session(session.clone(), &server_url).await {
+            match crate::auth::authenticate_saved_session(session.clone(), &grpc).await {
                 Ok(result) => {
                     let full = result
                         .session
@@ -327,7 +337,7 @@ impl App {
 
     fn start_auth_register(&mut self, username: String) {
         let tx = self.internal_tx.clone();
-        let url = self.server_url.clone();
+        let grpc = self.grpc.clone();
         let name = if username.is_empty() {
             None
         } else {
@@ -346,7 +356,7 @@ impl App {
         });
 
         tokio::spawn(async move {
-            match crate::auth::register_new_device(&url, name.as_deref(), &step_tx).await {
+            match crate::auth::register_new_device(&grpc, name.as_deref(), &step_tx).await {
                 Ok(result) => {
                     let full = result
                         .session
@@ -397,9 +407,9 @@ impl App {
 
     fn start_auth_link(&mut self, token: String) {
         let tx = self.internal_tx.clone();
-        let url = self.server_url.clone();
+        let grpc = self.grpc.clone();
         tokio::spawn(async move {
-            match crate::auth::link_existing_device(&url, &token).await {
+            match crate::auth::link_existing_device(&grpc, &token).await {
                 Ok(result) => {
                     let full = result
                         .session
@@ -440,7 +450,15 @@ impl App {
                 self.contact_search.set_results(results);
             }
             InternalEvent::ContactSearchError(msg) => {
-                self.contact_search.set_error(msg);
+                let shown = if msg.contains("rate limit") || msg.contains("8:") {
+                    "Search limit (5/hour). Wait, then Enter once.".to_string()
+                } else {
+                    msg
+                };
+                self.contact_search.set_error(shown);
+            }
+            InternalEvent::InviteAccepted { user_id, username } => {
+                self.finish_add_contact(user_id, username);
             }
             InternalEvent::RegistrationStep(step) => {
                 self.registration.advance(step.index());
@@ -450,6 +468,7 @@ impl App {
                     self.registration.tick();
                 }
             }
+            InternalEvent::StreamAuthRequired => self.refresh_token_now(),
             InternalEvent::P2PStatus {
                 peer_id,
                 connected,
@@ -511,6 +530,8 @@ impl App {
                 self.user_id = user_id.clone();
                 self.device_id = device_id.clone();
                 self.access_token = access_token.clone();
+                self.grpc.set_token(Some(access_token.clone()));
+                self.grpc.set_device_id(Some(device_id.clone()));
                 self.connection = ConnectionState::Connected {
                     transport: transport_label(&self.transport).into(),
                     latency_ms: None,
@@ -602,11 +623,11 @@ impl App {
         session: config::Session,
         user_id: String,
         device_id: String,
-        access_token: String,
+        _access_token: String,
     ) {
         use crate::orchestrator_task::spawn_orchestrator_task;
         use crate::storage::Storage;
-        use crate::streaming::{StreamEvent, spawn_stream_worker};
+        use crate::streaming::{CursorTracker, StreamEvent, spawn_stream_worker};
         use construct_core::{
             crypto::{client_api::ClassicClient, suites::classic::ClassicSuiteProvider},
             orchestration::orchestrator::Orchestrator,
@@ -708,8 +729,13 @@ impl App {
         self.our_identity_key = orchestrator.identity_public_key_bytes().ok();
 
         // ── Spawn gRPC stream worker subscribed to known contacts ─────────────
+        let cursor = self
+            .read_storage
+            .as_ref()
+            .map(CursorTracker::load)
+            .unwrap_or_default();
         let (stream_tx, mut stream_rx) =
-            spawn_stream_worker(self.server_url.clone(), access_token.clone(), contact_ids);
+            spawn_stream_worker(self.grpc.clone(), contact_ids, cursor.clone());
         self.stream_tx = Some(stream_tx.clone());
 
         // Spawn the Orchestrator actor task.
@@ -718,8 +744,8 @@ impl App {
             storage,
             stream_tx,
             self.internal_tx.clone(),
-            self.server_url.clone(),
-            access_token.clone(),
+            self.grpc.clone(),
+            cursor.clone(),
             user_id.clone(),
             device_id.clone(),
         );
@@ -731,21 +757,13 @@ impl App {
         // ── Upload OTPKs in background ────────────────────────────────────────
         if !otpks.is_empty() {
             tracing::info!("OTPKs generated: {} keys", otpks.len());
-            let url = self.server_url.clone();
-            let token = access_token.clone();
             let did = device_id.clone();
             let keys = otpks.clone();
+            let grpc = self.grpc.clone();
             tokio::spawn(async move {
-                match crate::grpc::GrpcClient::connect_authed(&url, &token).await {
-                    Ok(client) => {
-                        client.set_device_id(Some(did.clone())).await;
-                        if let Err(e) =
-                            crate::grpc::upload_pre_keys(&client, &did, keys, false).await
-                        {
-                            tracing::warn!("OTPK upload failed: {e}");
-                        }
-                    }
-                    Err(e) => tracing::warn!("OTPK upload connect failed: {e}"),
+                grpc.set_device_id(Some(did.clone()));
+                if let Err(e) = crate::grpc::upload_pre_keys(&grpc, &did, keys, false).await {
+                    tracing::warn!("OTPK upload failed: {e}");
                 }
             });
         }
@@ -756,8 +774,10 @@ impl App {
         tokio::spawn(async move {
             while let Some(event) = stream_rx.recv().await {
                 match event {
-                    StreamEvent::Message(envelope) => {
-                        // Unpack the wire payload to extract header fields.
+                    StreamEvent::Message {
+                        envelope,
+                        stream_cursor,
+                    } => {
                         if let Ok(decoded) =
                             construct_core::wire_payload::unpack(&envelope.encrypted_payload)
                         {
@@ -772,6 +792,7 @@ impl App {
                                 ) => id.clone(),
                                 _ => String::new(),
                             };
+                            cursor.note(&message_id, stream_cursor);
                             let content_type = envelope.content_type as u8;
                             let is_control = matches!(
                                 content_type,
@@ -791,10 +812,14 @@ impl App {
                             );
                         }
                     }
-                    StreamEvent::Ack(id) => {
+                    StreamEvent::Ack {
+                        message_id,
+                        stream_cursor,
+                    } => {
+                        cursor.note(&message_id, stream_cursor);
                         let _ = orch_tx.send(
                             construct_core::orchestration::actions::IncomingEvent::AckReceived {
-                                message_id: id,
+                                message_id,
                             },
                         );
                     }
@@ -811,7 +836,35 @@ impl App {
                             crate::bridge::BridgeEvent::StreamStatus { connected: false },
                         ));
                     }
+                    StreamEvent::Reconnecting { attempt, delay } => {
+                        let _ = internal_tx.send(InternalEvent::Bridge(
+                            crate::bridge::BridgeEvent::StreamReconnecting {
+                                attempt,
+                                delay_ms: delay.as_millis() as u64,
+                            },
+                        ));
+                    }
+                    StreamEvent::AuthRequired => {
+                        let _ = internal_tx.send(InternalEvent::StreamAuthRequired);
+                    }
                 }
+            }
+        });
+    }
+
+    fn refresh_token_now(&mut self) {
+        let Some(session) = self.current_session.clone() else {
+            return;
+        };
+        let tx = self.internal_tx.clone();
+        let mut rx = crate::bridge::spawn_token_refresh_now(
+            self.grpc.clone(),
+            session.device_id,
+            session.refresh_token,
+        );
+        tokio::spawn(async move {
+            if let Some(msg) = rx.recv().await {
+                let _ = tx.send(InternalEvent::TokenRefresh(msg));
             }
         });
     }
@@ -819,7 +872,7 @@ impl App {
     fn start_token_refresh(&mut self, session: &Session) {
         let tx = self.internal_tx.clone();
         let mut rx = crate::bridge::spawn_token_refresh(
-            self.server_url.clone(),
+            self.grpc.clone(),
             session.device_id.clone(),
             session.refresh_token.clone(),
             session.expires_at,
@@ -839,13 +892,18 @@ impl App {
                 refresh_token,
                 expires_at,
             } => {
+                self.access_token = access_token.clone();
+                self.grpc.set_token(Some(access_token.clone()));
                 let updated = self.build_updated_session(access_token, refresh_token, expires_at);
                 if let Some(session) = updated {
                     self.persist_session_background(session);
                 }
             }
-            TokenRefreshMsg::Failed(e) => {
-                tracing::warn!("Token refresh failed ({e}) — attempting device re-auth");
+            TokenRefreshMsg::FailedTransport(e) => {
+                tracing::warn!("Token refresh transport failure ({e}) — keeping tokens");
+            }
+            TokenRefreshMsg::FailedAuth(e) => {
+                tracing::warn!("Token refresh rejected ({e}) — attempting device re-auth");
                 self.start_device_reauth();
             }
         }
@@ -861,9 +919,9 @@ impl App {
             return;
         };
         let tx = self.internal_tx.clone();
-        let server_url = self.server_url.clone();
+        let grpc = self.grpc.clone();
         tokio::spawn(async move {
-            match crate::auth::authenticate_saved_session(session, &server_url).await {
+            match crate::auth::authenticate_saved_session(session, &grpc).await {
                 Ok(result) => {
                     let full = result
                         .session
@@ -946,14 +1004,38 @@ impl App {
                 // TODO: update delivery indicator
             }
             BridgeEvent::StreamStatus { connected } => {
-                self.status = if connected {
-                    "● connected".into()
+                if connected {
+                    self.connection = ConnectionState::Connected {
+                        transport: transport_label(&self.transport).into(),
+                        latency_ms: None,
+                    };
+                    self.status = "● connected".into();
                 } else {
-                    "○ disconnected".into()
+                    self.connection = ConnectionState::Disconnected;
+                    self.status = "○ disconnected".into();
+                }
+            }
+            BridgeEvent::StreamReconnecting { attempt, delay_ms } => {
+                let interval = std::time::Duration::from_millis(delay_ms);
+                self.connection = ConnectionState::Reconnecting {
+                    attempt,
+                    next_retry: std::time::Instant::now() + interval,
+                    interval,
                 };
+                self.status = format!("↺ reconnecting (attempt {attempt})");
             }
             BridgeEvent::Error(e) => {
                 self.status = format!("Bridge error: {e}");
+            }
+            BridgeEvent::SessionReady { contact_id } => {
+                let name = self
+                    .chat_list
+                    .contacts
+                    .iter()
+                    .find(|c| c.id == contact_id)
+                    .map(|c| c.display_name.as_str())
+                    .unwrap_or("contact");
+                self.status = format!("Session ready with @{name}");
             }
         }
     }
@@ -1217,6 +1299,14 @@ impl App {
                 }
                 KeyCode::Enter | KeyCode::Tab => {
                     if let Some(c) = self.chat_list.selected_contact() {
+                        if let Some(ref orch) = self.orch_handle {
+                            orch.send(
+                                construct_core::orchestration::actions::IncomingEvent::ActiveChatChanged {
+                                    contact_id: c.id.clone(),
+                                    is_active: true,
+                                },
+                            );
+                        }
                         self.chat_view.contact_name = c.display_name.clone();
                         self.chat_view.messages.clear();
                         // Load history from DB (last 50 messages).
@@ -1253,8 +1343,10 @@ impl App {
                 KeyCode::Char('s') if key.modifiers == crossterm::event::KeyModifiers::NONE => {
                     self.screen = Screen::Settings;
                 }
-                // Add contact / search
-                KeyCode::Char('n') if key.modifiers == crossterm::event::KeyModifiers::NONE => {
+                // Add contact / search (`a` as documented, `n` as the old binding)
+                KeyCode::Char('a' | 'n')
+                    if key.modifiers == crossterm::event::KeyModifiers::NONE =>
+                {
                     self.contact_search.reset();
                     self.screen = Screen::ContactSearch;
                 }
@@ -1416,77 +1508,141 @@ impl App {
                 self.contact_search.reset();
                 self.screen = Screen::Main;
             }
-            KeyCode::Down | KeyCode::Char('j') => self.contact_search.next(),
+            KeyCode::Down => self.contact_search.next(),
+            KeyCode::Up => self.contact_search.prev(),
             KeyCode::Enter => {
-                let query = self.contact_search.query.trim().to_string();
-                if !query.is_empty() {
-                    self.contact_search.searching = true;
-                    let tx = self.internal_tx.clone();
-                    let url = self.server_url.clone();
-                    let token = self.access_token.clone();
-                    tokio::spawn(async move {
-                        let result = async {
-                            let client =
-                                crate::grpc::GrpcClient::connect_authed(&url, &token).await?;
-                            crate::grpc::find_user(&client, &query).await
-                        }
-                        .await;
-                        match result {
-                            Ok(Some(user_id)) => {
-                                let _ = tx.send(InternalEvent::ContactSearchResult(vec![
-                                    SearchResult {
-                                        user_id,
-                                        username: query.clone(),
-                                        display_name: query,
-                                    },
-                                ]));
-                            }
-                            Ok(None) => {
-                                let _ = tx.send(InternalEvent::ContactSearchResult(vec![]));
-                            }
-                            Err(e) => {
-                                let _ = tx.send(InternalEvent::ContactSearchError(e.to_string()));
-                            }
-                        }
-                    });
+                if self.contact_search.selected().is_some() {
+                    self.add_selected_search_result();
+                } else {
+                    self.submit_contact_search();
                 }
             }
             KeyCode::Tab => self.contact_search.next(),
             KeyCode::BackTab => self.contact_search.prev(),
-            // Ctrl+A — add selected contact and save to DB
             KeyCode::Char('a') if key.modifiers == crossterm::event::KeyModifiers::CONTROL => {
-                if let Some(result) = self.contact_search.selected().cloned() {
-                    let new_contact = Contact {
-                        id: result.user_id.clone(),
-                        display_name: result.display_name.clone(),
-                        unread: 0,
-                        last_message: None,
-                    };
-                    // Persist to DB
-                    if let Some(ref storage) = self.read_storage {
-                        let _ = storage.upsert_contact(&crate::storage::StoredContact {
-                            user_id: result.user_id.clone(),
-                            display_name: result.display_name.clone(),
-                            identity_key_b64: String::new(),
-                        });
-                    }
-                    // Subscribe to stream for this contact
-                    if let Some(ref tx) = self.stream_tx {
-                        let _ = tx.try_send(crate::streaming::StreamCmd::Subscribe(
-                            vec![result.user_id.clone()],
-                            None,
-                        ));
-                    }
-                    self.chat_list.add_contact(new_contact);
-                    self.status = format!("Added @{}", result.username);
-                    self.contact_search.reset();
-                    self.screen = Screen::Main;
-                }
+                self.add_selected_search_result();
             }
             KeyCode::Backspace => self.contact_search.pop_char(),
             KeyCode::Char(c) => self.contact_search.push_char(c),
             _ => {}
         }
+    }
+
+    fn submit_contact_search(&mut self) {
+        let raw = self.contact_search.query.trim().to_string();
+        if crate::invite::looks_like_invite(&raw) {
+            self.redeem_pasted_invite(&raw);
+            return;
+        }
+        let query = crate::grpc::users::normalize_username(&self.contact_search.query);
+        if !crate::grpc::users::username_is_searchable(&query) {
+            self.contact_search
+                .set_error("Username: 3–30 chars, letters/digits/_  (no @)");
+            return;
+        }
+        self.contact_search.searching = true;
+        let tx = self.internal_tx.clone();
+        let grpc = self.grpc.clone();
+        tokio::spawn(async move {
+            let result = crate::grpc::find_user(&grpc, &query).await;
+            match result {
+                Ok(Some(user_id)) => {
+                    let _ = tx.send(InternalEvent::ContactSearchResult(vec![SearchResult {
+                        user_id,
+                        username: query.clone(),
+                        display_name: query,
+                    }]));
+                }
+                Ok(None) => {
+                    let _ = tx.send(InternalEvent::ContactSearchResult(vec![]));
+                }
+                Err(e) => {
+                    let _ = tx.send(InternalEvent::ContactSearchError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn add_selected_search_result(&mut self) {
+        let Some(result) = self.contact_search.selected().cloned() else {
+            return;
+        };
+        self.finish_add_contact(result.user_id, result.username);
+    }
+
+    fn finish_add_contact(&mut self, user_id: String, username: String) {
+        let new_contact = Contact {
+            id: user_id.clone(),
+            display_name: username.clone(),
+            unread: 0,
+            last_message: None,
+        };
+        if let Some(ref storage) = self.read_storage {
+            let _ = storage.upsert_contact(&crate::storage::StoredContact {
+                user_id: user_id.clone(),
+                display_name: username.clone(),
+                identity_key_b64: String::new(),
+            });
+        }
+        if let Some(ref tx) = self.stream_tx {
+            let _ = tx.try_send(crate::streaming::StreamCmd::Subscribe(
+                vec![user_id.clone()],
+                None,
+            ));
+        }
+        self.chat_list.add_contact(new_contact);
+        if let Some(ref orch) = self.orch_handle {
+            orch.send(
+                construct_core::orchestration::actions::IncomingEvent::ActiveChatChanged {
+                    contact_id: user_id,
+                    is_active: true,
+                },
+            );
+        }
+        self.status = format!("Added @{username} — opening session");
+        self.contact_search.reset();
+        self.screen = Screen::Main;
+    }
+
+    fn redeem_pasted_invite(&mut self, raw: &str) {
+        let invite = match crate::invite::parse_invite(raw) {
+            Ok(inv) => inv,
+            Err(e) => {
+                self.contact_search.set_error(format!("Bad invite: {e:#}"));
+                return;
+            }
+        };
+        if invite.is_expired(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+        ) {
+            self.contact_search.set_error("Invite expired");
+            return;
+        }
+        self.contact_search.searching = true;
+        self.contact_search.status = Some("Redeeming invite…".into());
+        let tx = self.internal_tx.clone();
+        let grpc = self.grpc.clone();
+        let username = invite
+            .un
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| invite.uuid[..8.min(invite.uuid.len())].to_string());
+        tokio::spawn(async move {
+            match crate::grpc::accept_invite(&grpc, &invite).await {
+                Ok(accepted) => {
+                    let _ = tx.send(InternalEvent::InviteAccepted {
+                        user_id: accepted.user_id,
+                        username,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(InternalEvent::ContactSearchError(format!("Invite: {e}")));
+                }
+            }
+        });
     }
 
     /// Execute a confirmed contact deletion: remove from storage, chat list, and active view.
@@ -1532,6 +1688,15 @@ impl App {
         if let Some(ref tx) = self.stream_tx.take() {
             let _ = tx.try_send(crate::streaming::StreamCmd::Shutdown);
         }
+        if let Some(ref storage) = self.read_storage {
+            let _ = storage.clear_stream_cursor();
+        }
+        self.grpc.set_token(None);
+        self.grpc.set_device_id(None);
+        let grpc = self.grpc.clone();
+        tokio::spawn(async move {
+            grpc.invalidate_h3().await;
+        });
         self.read_storage = None;
         self.session_key = None;
         self.current_session = None;
@@ -1639,7 +1804,7 @@ impl App {
         // Hint at bottom
         let hint = Paragraph::new(Line::from(vec![
             Span::styled(
-                "  Scan with Construct iOS to add as node  ",
+                "  Scan with Konstruct iOS  (v5, 5 min)  ",
                 Style::default().fg(Color::DarkGray),
             ),
             Span::styled(

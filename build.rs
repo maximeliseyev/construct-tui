@@ -22,6 +22,7 @@ fn compile_protos() {
         format!("{protos_dir}/services/key_service.proto"),
         format!("{protos_dir}/services/messaging_service.proto"),
         format!("{protos_dir}/services/user_service.proto"),
+        format!("{protos_dir}/services/invite_service.proto"),
         format!("{protos_dir}/services/notification_service.proto"),
     ];
 

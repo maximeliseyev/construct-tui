@@ -1,10 +1,8 @@
-//! Bidirectional `MessagingService/MessageStream`.
-//!
-//! Ported from construct-engine `transport/stream.rs`.
+//! Bidirectional `MessagingService/MessageStream` over HTTP/2.
 
 use std::time::Duration;
 
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use http::Request;
 use prost::Message;
 use tokio::sync::mpsc;
@@ -13,7 +11,7 @@ use tracing::{debug, error, info, warn};
 use crate::proto::core::v1::Envelope;
 use crate::proto::services::v1::{MessageStreamRequest, SubscribeRequest, message_stream_request};
 
-use super::client::GrpcClient;
+use super::client::{GrpcClient, apply_auth_headers, check_grpc_status, send_h2_data};
 use super::error::GrpcError;
 use super::framing::encode_frame;
 use super::paths::MESSAGING_STREAM;
@@ -60,37 +58,35 @@ where
     F: Fn(Bytes) + Send + 'static,
 {
     let mut send_req = client.send_request_handle().await?;
-    let (token, device_id) = client.auth_headers().await;
+    let (token, device_id) = client.auth_headers();
     let authority = client.authority();
 
-    let uri = format!("https://{authority}{MESSAGING_STREAM}");
-    let mut builder = Request::builder()
+    let builder = Request::builder()
         .method("POST")
-        .uri(&uri)
-        .header("content-type", "application/grpc+proto")
-        .header("te", "trailers")
-        .header("grpc-encoding", "identity")
-        .header(
-            "user-agent",
-            format!("konstruct-tui/{}", env!("CARGO_PKG_VERSION")),
-        );
-    if let Some(t) = token.as_deref() {
-        builder = builder.header("authorization", format!("Bearer {t}"));
-    }
-    if let Some(id) = device_id.as_deref() {
-        builder = builder.header("x-device-id", id);
-    }
-
-    let req = builder
+        .uri(MESSAGING_STREAM)
+        .header("host", authority);
+    let req = apply_auth_headers(builder, token.as_deref(), device_id.as_deref())
         .body(())
         .map_err(|e| GrpcError::transport(format!("build stream request: {e}")))?;
-    let mut stream = send_req
-        .send_request(req)
-        .await
+
+    let (resp_fut, mut send_stream) = send_req
+        .send_request(req, false)
         .map_err(|e| GrpcError::transport(format!("open MessageStream: {e}")))?;
 
-    let response = stream
-        .recv_response()
+    let subscribe = MessageStreamRequest {
+        request: Some(message_stream_request::Request::Subscribe(
+            SubscribeRequest {
+                conversation_ids: conversation_ids.clone(),
+                since_cursor,
+                include_presence: false,
+            },
+        )),
+        request_id: uuid_v4(),
+        attempt_id: None,
+    };
+    send_h2_data(&mut send_stream, encode_frame(&subscribe.encode_to_vec())).await?;
+
+    let response = resp_fut
         .await
         .map_err(|e| GrpcError::transport(format!("MessageStream recv_response: {e}")))?;
     if response.status() != http::StatusCode::OK {
@@ -99,34 +95,21 @@ where
             response.status()
         )));
     }
+    check_grpc_status(response.headers())?;
     info!(
         "MessageStream open — {} conversation(s)",
         conversation_ids.len()
     );
 
-    let subscribe = MessageStreamRequest {
-        request: Some(message_stream_request::Request::Subscribe(
-            SubscribeRequest {
-                conversation_ids,
-                since_cursor,
-                include_presence: false,
-            },
-        )),
-        request_id: uuid_v4(),
-        attempt_id: None,
-    };
-    stream
-        .send_data(encode_frame(&subscribe.encode_to_vec()))
-        .await
-        .map_err(|e| GrpcError::transport(format!("SubscribeRequest send: {e}")))?;
-
+    let recv = response.into_body();
     let (frame_tx, frame_rx) = mpsc::channel::<Bytes>(OUTGOING_CHANNEL_DEPTH);
-    let task = tokio::spawn(pump_task(stream, frame_rx, on_frame));
+    let task = tokio::spawn(pump_task(send_stream, recv, frame_rx, on_frame));
     Ok(MessageStream { frame_tx, task })
 }
 
 async fn pump_task<F>(
-    mut stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    mut send: h2::SendStream<Bytes>,
+    mut recv: h2::RecvStream,
     mut outgoing_rx: mpsc::Receiver<Bytes>,
     on_frame: F,
 ) where
@@ -135,51 +118,57 @@ async fn pump_task<F>(
     debug!("MessageStream pump started");
     let mut recv_buf = bytes::BytesMut::new();
     loop {
-        loop {
-            match outgoing_rx.try_recv() {
-                Ok(frame) => {
-                    if let Err(e) = stream.send_data(frame).await {
-                        warn!("MessageStream send_data failed: {e}");
-                        let _ = stream.finish().await;
+        tokio::select! {
+            outgoing = outgoing_rx.recv() => {
+                match outgoing {
+                    Some(frame) => {
+                        if let Err(e) = send_h2_data(&mut send, frame).await {
+                            warn!("MessageStream send_data failed: {e}");
+                            send.send_reset(h2::Reason::CANCEL);
+                            return;
+                        }
+                    }
+                    None => {
+                        info!("MessageStream outgoing channel closed");
+                        let _ = send.send_data(Bytes::new(), true);
                         return;
                     }
                 }
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    info!("MessageStream outgoing channel closed");
-                    let _ = stream.finish().await;
-                    return;
+            }
+            incoming = tokio::time::timeout(RECV_POLL_INTERVAL, recv.data()) => {
+                match incoming {
+                    Ok(Some(Ok(chunk))) => {
+                        let n = chunk.len();
+                        recv_buf.extend_from_slice(&chunk);
+                        let _ = recv.flow_control().release_capacity(n);
+                        loop {
+                            if recv_buf.len() < 5 {
+                                break;
+                            }
+                            let msg_len = u32::from_be_bytes([
+                                recv_buf[1],
+                                recv_buf[2],
+                                recv_buf[3],
+                                recv_buf[4],
+                            ]) as usize;
+                            if recv_buf.len() < 5 + msg_len {
+                                break;
+                            }
+                            let frame = recv_buf.split_to(5 + msg_len).freeze();
+                            on_frame(frame);
+                        }
+                    }
+                    Ok(Some(Err(e))) => {
+                        error!("MessageStream recv_data error: {e}");
+                        return;
+                    }
+                    Ok(None) => {
+                        info!("MessageStream: server closed send side");
+                        return;
+                    }
+                    Err(_timeout) => {}
                 }
             }
-        }
-
-        match tokio::time::timeout(RECV_POLL_INTERVAL, stream.recv_data()).await {
-            Ok(Ok(Some(mut chunk))) => {
-                let data: Bytes = chunk.copy_to_bytes(chunk.remaining());
-                recv_buf.extend_from_slice(&data);
-                loop {
-                    if recv_buf.len() < 5 {
-                        break;
-                    }
-                    let msg_len =
-                        u32::from_be_bytes([recv_buf[1], recv_buf[2], recv_buf[3], recv_buf[4]])
-                            as usize;
-                    if recv_buf.len() < 5 + msg_len {
-                        break;
-                    }
-                    let frame = recv_buf.split_to(5 + msg_len).freeze();
-                    on_frame(frame);
-                }
-            }
-            Ok(Ok(None)) => {
-                info!("MessageStream: server closed send side");
-                return;
-            }
-            Ok(Err(e)) => {
-                error!("MessageStream recv_data error: {e}");
-                return;
-            }
-            Err(_timeout) => {}
         }
     }
 }

@@ -30,6 +30,16 @@ pub async fn get_pow_challenge(client: &GrpcClient) -> Result<(String, u32), Grp
         .await?;
     let resp = GetPowChallengeResponse::decode(bytes.as_slice())
         .map_err(|e| GrpcError::transport(format!("GetPowChallenge decode: {e}")))?;
+    if resp.challenge.is_empty() {
+        return Err(GrpcError::transport(
+            "GetPowChallenge returned an empty challenge (HTTP/2 body missing?)",
+        ));
+    }
+    tracing::info!(
+        difficulty = resp.difficulty,
+        challenge_len = resp.challenge.len(),
+        "PoW challenge received"
+    );
     Ok((resp.challenge, resp.difficulty))
 }
 
@@ -110,7 +120,6 @@ pub async fn confirm_device_link(
         link_token: link_token.to_string(),
         device_id: device_id.to_string(),
         public_keys: Some(public_keys),
-        ..Default::default()
     };
     let bytes = client
         .unary(paths::DEVICE_CONFIRM_LINK, &req.encode_to_vec())

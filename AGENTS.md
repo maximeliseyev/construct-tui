@@ -65,18 +65,18 @@ Do not copy `.proto` files into this repo. `build.rs` reads `CONSTRUCT_PROTOS_DI
 ```
 screens/  →  app.rs
               ├── orchestrator_task.rs  →  construct-core Orchestrator
-              └── grpc/                 →  gRPC-over-H3 (system-root TLS)
+              └── grpc/                 →  gRPC-over-H2 (system-root TLS; ams.konstruct.cc)
 ```
 
 - **`construct-engine` does not come back.** Retired from messenger 2026-07-28, dropped from
   this crate 2026-08-22. No `EngineAdapter`, no `UiEvent`/`PlatformAction` façade. See
   `decisions/macos-desktop-strategy.md` — the 2026-06-16 trigger "engine returns if a TUI
   push starts" is retired; the TUI push started and still does not use the engine.
-- **Do not depend on `construct-transport`.** That crate is the iOS UniFFI pipe and
-  `QuicClient::connect` wants a **pinned gateway cert**. The TUI talks to a public hostname
-  with the platform trust store. Growing transport to serve both products in one session is
-  how two clients get coupled. Code lives in `src/grpc/` until a second non-Apple client
-  exists; then lift the directory. Decision: `decisions/tui-in-tree-grpc.md`.
+- **Do not depend on `construct-transport`.** That crate is the iOS UniFFI QUIC pipe and
+  `QuicClient::connect` wants a **pinned gateway cert** on `quic.konstruct.cc`. The TUI
+  talks to `ams.konstruct.cc` over **HTTP/2** with the platform trust store (same as iOS
+  TCP). QUIC handshake to `ams.konstruct.cc` times out — Traefik H3 was removed; that
+  hostname is Caddy H2. Decision: `decisions/tui-in-tree-grpc.md`.
 - **Screens and `app.rs` do not import `h3` / `quinn` / `construct-core` internals.** Crypto
   goes through `orchestrator_task`; network I/O through `grpc/`. `src/grpc/` has no Ratatui
   types and no `App` types — that is the extract boundary.

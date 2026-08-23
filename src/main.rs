@@ -5,6 +5,7 @@ mod config;
 mod event;
 mod grpc;
 mod invite;
+mod knst;
 mod orchestrator_task;
 mod proto;
 mod screens;
@@ -83,7 +84,7 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // rustls CryptoProvider is installed on first GrpcClient::connect.
+    // rustls CryptoProvider is installed in GrpcClient::new.
 
     let cli = Cli::parse();
 

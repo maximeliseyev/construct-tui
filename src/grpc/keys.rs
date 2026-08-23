@@ -14,10 +14,21 @@ use super::client::GrpcClient;
 use super::error::GrpcError;
 use super::paths;
 
+/// Pre-key bundle plus the Kyber keys that `X3DHPublicKeyBundle` does not carry.
+///
+/// `init_session_with_bundle` takes Kyber SPK / OTPK as separate arguments; they
+/// must survive the JSON hop through `Action::InitSession`.
+pub struct FetchedPreKeyBundle {
+    pub x3dh: X3DHPublicKeyBundle,
+    pub kyber_pre_key: Option<Vec<u8>>,
+    pub kyber_one_time_prekey: Option<Vec<u8>>,
+    pub kyber_one_time_prekey_id: Option<u32>,
+}
+
 pub async fn get_pre_key_bundle(
     client: &GrpcClient,
     user_id: &str,
-) -> Result<X3DHPublicKeyBundle, GrpcError> {
+) -> Result<FetchedPreKeyBundle, GrpcError> {
     let req = GetPreKeyBundleRequest {
         user_id: user_id.to_string(),
         consume_one_time_prekey: Some(true),
@@ -28,7 +39,23 @@ pub async fn get_pre_key_bundle(
         .await?;
     let resp = GetPreKeyBundleResponse::decode(bytes.as_slice())
         .map_err(|e| GrpcError::transport(format!("GetPreKeyBundle decode: {e}")))?;
-    bundle_to_x3dh(resp)
+    let (kyber_pre_key, kyber_one_time_prekey, kyber_one_time_prekey_id) = resp
+        .bundle
+        .as_ref()
+        .map(|b| {
+            (
+                b.kyber_pre_key.as_ref().map(|k| k.to_vec()),
+                b.kyber_one_time_pre_key.as_ref().map(|k| k.to_vec()),
+                b.kyber_one_time_pre_key_id,
+            )
+        })
+        .unwrap_or((None, None, None));
+    Ok(FetchedPreKeyBundle {
+        x3dh: bundle_to_x3dh(resp)?,
+        kyber_pre_key,
+        kyber_one_time_prekey,
+        kyber_one_time_prekey_id,
+    })
 }
 
 pub async fn upload_pre_keys(

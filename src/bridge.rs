@@ -34,8 +34,12 @@ pub enum BridgeEvent {
     MessageDelivered { message_id: String },
     /// Stream connection status changed (connected / disconnected).
     StreamStatus { connected: bool },
+    /// Stream is retrying after a drop.
+    StreamReconnecting { attempt: u32, delay_ms: u64 },
     /// A platform-level error worth surfacing.
     Error(String),
+    /// Double Ratchet session with this contact is ready for encrypt/decrypt.
+    SessionReady { contact_id: String },
 }
 
 // ── TuiBridge ─────────────────────────────────────────────────────────────────
@@ -182,8 +186,10 @@ pub enum TokenRefreshMsg {
         refresh_token: String,
         expires_at: i64,
     },
-    /// Refresh failed — app should force re-auth.
-    Failed(String),
+    /// Network/H3 failure — keep tokens, let the stream reconnect.
+    FailedTransport(String),
+    /// Refresh token rejected (gRPC 16/7) — device re-auth, do not wipe yet.
+    FailedAuth(String),
 }
 
 /// Spawn a background task that refreshes the access token 5 minutes before expiry.
@@ -191,14 +197,14 @@ pub enum TokenRefreshMsg {
 /// Sends at most one `TokenRefreshMsg` per lifetime; the app is responsible for
 /// restarting the task after a successful refresh with the new `expires_at`.
 pub fn spawn_token_refresh(
-    server_url: String,
+    client: crate::grpc::GrpcClient,
     device_id: String,
     refresh_token: String,
     expires_at: i64,
 ) -> mpsc::Receiver<TokenRefreshMsg> {
     let (tx, rx) = mpsc::channel(1);
     tokio::spawn(token_refresh_loop(
-        server_url,
+        client,
         device_id,
         refresh_token,
         expires_at,
@@ -207,8 +213,22 @@ pub fn spawn_token_refresh(
     rx
 }
 
+/// Refresh immediately on the shared client (stream got gRPC 16).
+pub fn spawn_token_refresh_now(
+    client: crate::grpc::GrpcClient,
+    device_id: String,
+    refresh_token: String,
+) -> mpsc::Receiver<TokenRefreshMsg> {
+    let (tx, rx) = mpsc::channel(1);
+    tokio::spawn(async move {
+        let msg = do_refresh(&client, &device_id, &refresh_token).await;
+        let _ = tx.send(msg).await;
+    });
+    rx
+}
+
 async fn token_refresh_loop(
-    server_url: String,
+    client: crate::grpc::GrpcClient,
     device_id: String,
     refresh_token: String,
     expires_at: i64,
@@ -222,31 +242,31 @@ async fn token_refresh_loop(
 
     tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
 
-    let msg = match do_refresh(&server_url, &device_id, &refresh_token).await {
-        Ok(m) => m,
-        Err(e) => TokenRefreshMsg::Failed(e.to_string()),
-    };
+    let msg = do_refresh(&client, &device_id, &refresh_token).await;
     let _ = tx.send(msg).await;
 }
 
 async fn do_refresh(
-    server_url: &str,
+    client: &crate::grpc::GrpcClient,
     device_id: &str,
     refresh_token: &str,
-) -> Result<TokenRefreshMsg> {
-    let client = crate::grpc::GrpcClient::connect(server_url).await?;
-    client.set_device_id(Some(device_id.to_string())).await;
-    let (access_token, new_refresh, expires_at) =
-        crate::grpc::refresh_token(&client, refresh_token, device_id).await?;
-    Ok(TokenRefreshMsg::Refreshed {
-        access_token,
-        refresh_token: if new_refresh.is_empty() {
-            refresh_token.to_string()
-        } else {
-            new_refresh
+) -> TokenRefreshMsg {
+    client.set_device_id(Some(device_id.to_string()));
+    match crate::grpc::refresh_token(client, refresh_token, device_id).await {
+        Ok((access_token, new_refresh, expires_at)) => TokenRefreshMsg::Refreshed {
+            access_token,
+            refresh_token: if new_refresh.is_empty() {
+                refresh_token.to_string()
+            } else {
+                new_refresh
+            },
+            expires_at,
         },
-        expires_at,
-    })
+        Err(e) if e.is_unauthenticated() || e.is_permission_denied() => {
+            TokenRefreshMsg::FailedAuth(e.to_string())
+        }
+        Err(e) => TokenRefreshMsg::FailedTransport(e.to_string()),
+    }
 }
 
 fn now_unix_secs() -> i64 {

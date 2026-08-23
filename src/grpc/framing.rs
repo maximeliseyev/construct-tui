@@ -41,25 +41,3 @@ pub fn decode_frame(mut data: Bytes) -> Result<(Bytes, Bytes), GrpcError> {
     let msg = data.split_to(msg_len);
     Ok((msg, data))
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum GrpcStatus {
-    Ok = 0,
-    Unknown = 2,
-    Unauthenticated = 16,
-}
-
-impl GrpcStatus {
-    pub fn from_code(code: u32) -> Self {
-        match code {
-            0 => Self::Ok,
-            16 => Self::Unauthenticated,
-            _ => Self::Unknown,
-        }
-    }
-
-    pub fn is_ok(self) -> bool {
-        self == Self::Ok
-    }
-}

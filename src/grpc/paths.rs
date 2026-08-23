@@ -14,3 +14,4 @@ pub const KEY_UPLOAD: &str = "/shared.proto.services.v1.KeyService/UploadPreKeys
 pub const KEY_COUNT: &str = "/shared.proto.services.v1.KeyService/GetPreKeyCount";
 pub const MESSAGING_STREAM: &str = "/shared.proto.services.v1.MessagingService/MessageStream";
 pub const USER_FIND: &str = "/shared.proto.services.v1.UserService/FindUser";
+pub const INVITE_ACCEPT: &str = "/shared.proto.services.v1.InviteService/AcceptInvite";

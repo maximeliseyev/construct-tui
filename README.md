@@ -147,7 +147,7 @@ gRPC (register, authenticate, device link, token refresh, pre-key bundle, FindUs
 | `Shift+Tab` | Focus contact list from compose |
 | `Enter` (in compose) | Send message |
 | `s` | Open settings |
-| `a` | Add contact (search) |
+| `a` / `n` | Add contact (search) |
 | `q` | Quit (when compose is not focused) |
 | `Ctrl+C` | Force quit (any screen) |
 
@@ -163,9 +163,9 @@ gRPC (register, authenticate, device link, token refresh, pre-key bundle, FindUs
 
 | Key | Action |
 |-----|--------|
-| Type | Search by username |
+| Type | Search by username, or paste `https://konstruct.cc/add?invite=…` |
+| `Enter` | Search / redeem invite; if a result is selected, add it |
 | `↑` / `↓` | Navigate results |
-| `Ctrl+A` | Add selected contact |
 | `Esc` | Close |
 
 ---

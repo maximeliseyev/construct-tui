@@ -24,14 +24,15 @@ use construct_core::orchestration::{
     actions::{Action, IncomingEvent},
     orchestrator::Orchestrator,
 };
-use prost::Message as _;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
 use crate::bridge::BridgeEvent;
+use crate::grpc::GrpcClient;
 use crate::proto::core::v1::{ContentType, Envelope, UserId, envelope::MessageIdType};
 use crate::storage::Storage;
-use crate::streaming::StreamCmd;
+use crate::streaming::{CursorTracker, StreamCmd};
 
 // ── Public handle ─────────────────────────────────────────────────────────────
 
@@ -56,7 +57,8 @@ impl OrchestratorHandle {
 /// * `storage` — open SQLite storage
 /// * `stream_tx` — command channel to the gRPC stream worker
 /// * `internal_tx` — channel back to the UI app event loop (BridgeEvent)
-/// * `grpc_url` / `access_token` — for FetchPublicKeyBundle and key upload
+/// * `grpc` — shared gRPC client (bundle fetch)
+/// * `cursor` — stream watermark, advanced after inbound persist
 /// * `my_user_id` / `my_device_id` — local identity for Envelope construction
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_orchestrator_task(
@@ -64,8 +66,8 @@ pub fn spawn_orchestrator_task(
     storage: Storage,
     stream_tx: mpsc::Sender<StreamCmd>,
     internal_tx: mpsc::UnboundedSender<crate::app::InternalEventProxy>,
-    grpc_url: String,
-    access_token: String,
+    grpc: GrpcClient,
+    cursor: CursorTracker,
     my_user_id: String,
     my_device_id: String,
 ) -> OrchestratorHandle {
@@ -77,8 +79,8 @@ pub fn spawn_orchestrator_task(
         storage,
         stream_tx,
         internal_tx,
-        grpc_url,
-        access_token,
+        grpc,
+        cursor,
         my_user_id,
         my_device_id,
         tx,
@@ -96,8 +98,8 @@ async fn run(
     mut storage: Storage,
     stream_tx: mpsc::Sender<StreamCmd>,
     internal_tx: mpsc::UnboundedSender<crate::app::InternalEventProxy>,
-    grpc_url: String,
-    access_token: String,
+    grpc: GrpcClient,
+    cursor: CursorTracker,
     my_user_id: String,
     my_device_id: String,
     self_tx: mpsc::UnboundedSender<IncomingEvent>,
@@ -106,6 +108,25 @@ async fn run(
     let mut timers: HashMap<String, AbortHandle> = HashMap::new();
 
     while let Some(event) = rx.recv().await {
+        let event = match prepare_outgoing(
+            event,
+            &mut orchestrator,
+            &mut storage,
+            &stream_tx,
+            &internal_tx,
+            &grpc,
+            &cursor,
+            &my_user_id,
+            &my_device_id,
+            &self_tx,
+            &mut timers,
+        )
+        .await
+        {
+            Some(event) => event,
+            None => continue,
+        };
+
         let actions = orchestrator.handle_event(event);
 
         // Collect any inline follow-up events (from synchronous Action handlers).
@@ -122,8 +143,8 @@ async fn run(
                 &mut storage,
                 &stream_tx,
                 &internal_tx,
-                &grpc_url,
-                &access_token,
+                &grpc,
+                &cursor,
                 &my_user_id,
                 &my_device_id,
                 &self_tx,
@@ -148,8 +169,8 @@ async fn run(
                     &mut storage,
                     &stream_tx,
                     &internal_tx,
-                    &grpc_url,
-                    &access_token,
+                    &grpc,
+                    &cursor,
                     &my_user_id,
                     &my_device_id,
                     &self_tx,
@@ -172,8 +193,8 @@ async fn dispatch(
     storage: &mut Storage,
     stream_tx: &mpsc::Sender<StreamCmd>,
     internal_tx: &mpsc::UnboundedSender<crate::app::InternalEventProxy>,
-    grpc_url: &str,
-    access_token: &str,
+    grpc: &GrpcClient,
+    cursor: &CursorTracker,
     my_user_id: &str,
     my_device_id: &str,
     self_tx: &mpsc::UnboundedSender<IncomingEvent>,
@@ -217,7 +238,7 @@ async fn dispatch(
                             // returned by init_receiving_session_from_wire_payload but is not
                             // re-emitted as MessageDecrypted by the Rust layer, so we handle it
                             // here.  Skip pure control messages (ping/heartbeat/empty).
-                            let first_text = decode_plaintext_text(&first_plaintext);
+                            let first_text = crate::knst::decode_text(&first_plaintext);
                             if !first_text.is_empty()
                                 && !first_text.starts_with('\0')
                                 && !first_text.contains("__session_ping_")
@@ -235,14 +256,19 @@ async fn dispatch(
                                     text_preview = %first_text.chars().take(40).collect::<String>(),
                                     "InitSession (Responder): surfacing first message"
                                 );
-                                let _ = storage.store_message(&crate::storage::StoredMessage {
-                                    id: first_message_id.clone(),
-                                    peer_id: contact_id.clone(),
-                                    text: first_text.clone(),
-                                    direction: "received".into(),
-                                    timestamp_ms: now_ms,
-                                    delivery_status: String::new(),
-                                });
+                                persist_inbound(
+                                    storage,
+                                    cursor,
+                                    &first_message_id,
+                                    crate::storage::StoredMessage {
+                                        id: first_message_id.clone(),
+                                        peer_id: contact_id.clone(),
+                                        text: first_text.clone(),
+                                        direction: "received".into(),
+                                        timestamp_ms: now_ms,
+                                        delivery_status: String::new(),
+                                    },
+                                );
                                 let _ = internal_tx.send(crate::app::InternalEventProxy::Bridge(
                                     BridgeEvent::NewMessage {
                                         peer_id: contact_id.clone(),
@@ -269,31 +295,35 @@ async fn dispatch(
                         contact_id = %contact_id,
                         "InitSession (Responder): pending_count>0 but no wire payload — falling back to Initiator"
                     );
-                    if let Ok(bundle) = serde_json::from_str::<X3DHPublicKeyBundle>(&bundle_json) {
-                        let _ = orchestrator.init_session_with_bundle(
-                            &contact_id,
-                            bundle,
-                            None,
-                            None,
-                            None,
-                            false,
+                    if let Err(e) =
+                        init_initiator_from_json(orchestrator, &contact_id, &bundle_json)
+                    {
+                        tracing::error!(
+                            target: "orchestrator_task",
+                            contact_id = %contact_id,
+                            error = %e,
+                            "InitSession (Initiator fallback): init_session_with_bundle failed"
                         );
+                        let _ = internal_tx.send(crate::app::InternalEventProxy::Bridge(
+                            BridgeEvent::Error(format!("[SESSION_INIT_FAILED] {e}")),
+                        ));
+                        return;
                     }
                 }
-            } else {
-                // INITIATOR path — no pending messages, we are starting fresh.
-                if let Ok(bundle) = serde_json::from_str::<X3DHPublicKeyBundle>(&bundle_json) {
-                    let _ = orchestrator.init_session_with_bundle(
-                        &contact_id,
-                        bundle,
-                        None,
-                        None,
-                        None,
-                        false,
-                    );
-                }
-                session_inited.insert(contact_id.clone());
+            } else if let Err(e) = init_initiator_from_json(orchestrator, &contact_id, &bundle_json)
+            {
+                tracing::error!(
+                    target: "orchestrator_task",
+                    contact_id = %contact_id,
+                    error = %e,
+                    "InitSession (Initiator): init_session_with_bundle failed"
+                );
+                let _ = internal_tx.send(crate::app::InternalEventProxy::Bridge(
+                    BridgeEvent::Error(format!("[SESSION_INIT_FAILED] {e}")),
+                ));
+                return;
             }
+            session_inited.insert(contact_id.clone());
             follow_ups.push(IncomingEvent::SessionInitCompleted {
                 contact_id,
                 session_data: vec![],
@@ -312,7 +342,7 @@ async fn dispatch(
             message_id,
             plaintext,
         } => {
-            let text = decode_plaintext_text(&plaintext);
+            let text = crate::knst::decode_text(&plaintext);
             tracing::info!(
                 target: "orchestrator_task",
                 contact_id = %contact_id,
@@ -327,14 +357,19 @@ async fn dispatch(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as i64;
-            let _ = storage.store_message(&crate::storage::StoredMessage {
-                id: message_id.clone(),
-                peer_id: contact_id.clone(),
-                text: text.clone(),
-                direction: "received".into(),
-                timestamp_ms: now_ms,
-                delivery_status: String::new(),
-            });
+            persist_inbound(
+                storage,
+                cursor,
+                &message_id,
+                crate::storage::StoredMessage {
+                    id: message_id.clone(),
+                    peer_id: contact_id.clone(),
+                    text: text.clone(),
+                    direction: "received".into(),
+                    timestamp_ms: now_ms,
+                    delivery_status: String::new(),
+                },
+            );
 
             // Notify UI.
             let _ = internal_tx.send(crate::app::InternalEventProxy::Bridge(
@@ -390,38 +425,30 @@ async fn dispatch(
                 let _ = stream_tx.try_send(StreamCmd::Send(Box::new(end_sess)));
 
                 // Re-fetch bundle and re-init INITIATOR session.
-                match fetch_bundle_json(
-                    grpc_url,
-                    access_token,
-                    my_user_id,
-                    my_device_id,
-                    &contact_id,
-                )
-                .await
-                {
+                match fetch_bundle_json(grpc, &contact_id).await {
                     Ok(bundle_json) => {
-                        if let Ok(bundle) =
-                            serde_json::from_str::<X3DHPublicKeyBundle>(&bundle_json)
+                        if let Err(e) =
+                            init_initiator_from_json(orchestrator, &contact_id, &bundle_json)
                         {
-                            let _ = orchestrator.init_session_with_bundle(
-                                &contact_id,
-                                bundle,
-                                None,
-                                None,
-                                None,
-                                false,
+                            tracing::error!(
+                                target: "orchestrator_task",
+                                contact_id = %contact_id,
+                                error = %e,
+                                "Heal (Initiator): init_session_with_bundle failed"
                             );
+                            return;
                         }
                         follow_ups.push(IncomingEvent::SessionInitCompleted {
                             contact_id: contact_id.clone(),
                             session_data: vec![],
                         });
-                        // Send a session ping so the peer can init as RESPONDER
-                        // without waiting for the user to type a message.
+                        // KNST session-ping occupies msgNum=0 so user text is not the
+                        // X3DH carrier. Type is byte 5 (25); envelope stays generic.
+                        let ping_id = uuid_v4();
                         follow_ups.push(IncomingEvent::OutgoingMessage {
                             contact_id: contact_id.clone(),
-                            message_id: uuid_v4(),
-                            plaintext: b"\x00PING\x00".to_vec(),
+                            message_id: ping_id.clone(),
+                            plaintext: crate::knst::encode_session_ping(&ping_id),
                             content_type: 0,
                         });
                     }
@@ -445,15 +472,7 @@ async fn dispatch(
                         "Heal (Responder): no queued wire payload — cannot heal"
                     ),
                     Some(wire) => {
-                        match fetch_bundle_json(
-                            grpc_url,
-                            access_token,
-                            my_user_id,
-                            my_device_id,
-                            &contact_id,
-                        )
-                        .await
-                        {
+                        match fetch_bundle_json(grpc, &contact_id).await {
                             Ok(bundle_json) => {
                                 match orchestrator.init_receiving_session_from_wire_payload(
                                     &contact_id,
@@ -471,7 +490,7 @@ async fn dispatch(
                                             .pop_first_pending(&contact_id)
                                             .unwrap_or_else(uuid_v4);
                                         // Surface the first message if it is real user content.
-                                        let first_text = decode_plaintext_text(&first_plaintext);
+                                        let first_text = crate::knst::decode_text(&first_plaintext);
                                         if !first_text.is_empty()
                                             && !first_text.starts_with('\0')
                                             && !first_text.contains("__session_ping_")
@@ -489,8 +508,11 @@ async fn dispatch(
                                                 text_preview = %first_text.chars().take(40).collect::<String>(),
                                                 "Heal (Responder): surfacing first message"
                                             );
-                                            let _ = storage.store_message(
-                                                &crate::storage::StoredMessage {
+                                            persist_inbound(
+                                                storage,
+                                                cursor,
+                                                &first_message_id,
+                                                crate::storage::StoredMessage {
                                                     id: first_message_id.clone(),
                                                     peer_id: contact_id.clone(),
                                                     text: first_text.clone(),
@@ -600,18 +622,29 @@ async fn dispatch(
         // ── Network ─────────────────────────────────────────────────────────
         Action::FetchPublicKeyBundle { user_id } => {
             let tx = self_tx.clone();
-            let grpc_url = grpc_url.to_string();
-            let access_token = access_token.to_string();
-            let my_uid = my_user_id.to_string();
-            let my_did = my_device_id.to_string();
+            let grpc = grpc.clone();
             let uid = user_id.clone();
+            let ui = internal_tx.clone();
             tokio::spawn(async move {
-                let bundle_json =
-                    fetch_bundle_json(&grpc_url, &access_token, &my_uid, &my_did, &uid).await;
-                let _ = tx.send(IncomingEvent::KeyBundleFetched {
-                    user_id: uid,
-                    bundle_json: bundle_json.unwrap_or_default(),
-                });
+                match fetch_bundle_json(&grpc, &uid).await {
+                    Ok(bundle_json) => {
+                        let _ = tx.send(IncomingEvent::KeyBundleFetched {
+                            user_id: uid,
+                            bundle_json,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            target: "orchestrator_task",
+                            user_id = %uid,
+                            error = %e,
+                            "GetPreKeyBundle failed"
+                        );
+                        let _ = ui.send(crate::app::InternalEventProxy::Bridge(
+                            BridgeEvent::Error(format!("[PREKEY_BUNDLE] {e:#}")),
+                        ));
+                    }
+                }
             });
         }
 
@@ -699,6 +732,9 @@ async fn dispatch(
                 contact_id = %contact_id,
                 "Session created"
             );
+            let _ = internal_tx.send(crate::app::InternalEventProxy::Bridge(
+                BridgeEvent::SessionReady { contact_id },
+            ));
         }
 
         Action::NotifyError { code, message } => {
@@ -746,18 +782,272 @@ async fn dispatch(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// JSON payload for `Action::InitSession`. `X3DHPublicKeyBundle` has no Kyber
+/// key fields; they ride next to it so PQXDH encapsulate can run.
+#[derive(Debug, Serialize, Deserialize)]
+struct SessionInitBundle {
+    #[serde(flatten)]
+    x3dh: X3DHPublicKeyBundle,
+    #[serde(default)]
+    kyber_pre_key_public: Option<Vec<u8>>,
+    #[serde(default)]
+    kyber_one_time_prekey_public: Option<Vec<u8>>,
+    #[serde(default)]
+    kyber_one_time_prekey_id: Option<u32>,
+}
+
+fn init_initiator_from_json(
+    orchestrator: &mut Orchestrator,
+    contact_id: &str,
+    bundle_json: &str,
+) -> Result<String, String> {
+    let bundle: SessionInitBundle = serde_json::from_str(bundle_json).map_err(|e| e.to_string())?;
+    orchestrator.init_session_with_bundle(
+        contact_id,
+        bundle.x3dh,
+        bundle.kyber_pre_key_public,
+        bundle.kyber_one_time_prekey_public,
+        bundle.kyber_one_time_prekey_id,
+        false,
+    )
+}
+
 /// Fetch a pre-key bundle from the gRPC key service and return it as
-/// the JSON string expected by `Orchestrator::init_session_with_bundle`.
-async fn fetch_bundle_json(
-    grpc_url: &str,
-    access_token: &str,
-    _my_user_id: &str,
-    _my_device_id: &str,
-    user_id: &str,
-) -> Result<String> {
-    let client = crate::grpc::GrpcClient::connect_authed(grpc_url, access_token).await?;
-    let bundle = crate::grpc::get_pre_key_bundle(&client, user_id).await?;
-    Ok(serde_json::to_string(&bundle)?)
+/// the JSON string expected by `init_initiator_from_json`.
+async fn fetch_bundle_json(client: &GrpcClient, user_id: &str) -> Result<String> {
+    let fetched = crate::grpc::get_pre_key_bundle(client, user_id).await?;
+    Ok(serde_json::to_string(&SessionInitBundle {
+        x3dh: fetched.x3dh,
+        kyber_pre_key_public: fetched.kyber_pre_key,
+        kyber_one_time_prekey_public: fetched.kyber_one_time_prekey,
+        kyber_one_time_prekey_id: fetched.kyber_one_time_prekey_id,
+    })?)
+}
+
+/// Before the Orchestrator sees an event:
+/// - opening a chat / adding a contact establishes an INITIATOR session
+/// - a send with no session does the same (message becomes the X3DH carrier)
+/// - UTF-8 chat text is wrapped in a KNST + `MessageContent` frame
+#[allow(clippy::too_many_arguments)]
+async fn prepare_outgoing(
+    event: IncomingEvent,
+    orchestrator: &mut Orchestrator,
+    storage: &mut Storage,
+    stream_tx: &mpsc::Sender<StreamCmd>,
+    internal_tx: &mpsc::UnboundedSender<crate::app::InternalEventProxy>,
+    grpc: &GrpcClient,
+    cursor: &CursorTracker,
+    my_user_id: &str,
+    my_device_id: &str,
+    self_tx: &mpsc::UnboundedSender<IncomingEvent>,
+    timers: &mut HashMap<String, AbortHandle>,
+) -> Option<IncomingEvent> {
+    match event {
+        IncomingEvent::ActiveChatChanged {
+            contact_id,
+            is_active: true,
+        } => {
+            let had_inbound = orchestrator.pending_message_count(&contact_id) > 0;
+            match establish_session(
+                orchestrator,
+                storage,
+                stream_tx,
+                internal_tx,
+                grpc,
+                cursor,
+                my_user_id,
+                my_device_id,
+                self_tx,
+                timers,
+                &contact_id,
+            )
+            .await
+            {
+                Ok(true) => {
+                    // New INITIATOR session — ping occupies msgNum=0 so the peer
+                    // can become RESPONDER before user text. Skip if we inited as
+                    // RESPONDER from a queued inbound (iOS sends ready, not ping).
+                    if !had_inbound {
+                        let ping_id = uuid_v4();
+                        let ping = IncomingEvent::OutgoingMessage {
+                            contact_id: contact_id.clone(),
+                            message_id: ping_id.clone(),
+                            plaintext: crate::knst::encode_session_ping(&ping_id),
+                            content_type: 0,
+                        };
+                        let actions = orchestrator.handle_event(ping);
+                        let mut follow_ups = Vec::new();
+                        let mut session_inited = std::collections::HashSet::new();
+                        for action in actions {
+                            dispatch(
+                                action,
+                                orchestrator,
+                                storage,
+                                stream_tx,
+                                internal_tx,
+                                grpc,
+                                cursor,
+                                my_user_id,
+                                my_device_id,
+                                self_tx,
+                                timers,
+                                &mut follow_ups,
+                                &mut session_inited,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::error!(
+                        target: "orchestrator_task",
+                        contact_id = %contact_id,
+                        error = %e,
+                        "proactive session init failed"
+                    );
+                    let _ = internal_tx.send(crate::app::InternalEventProxy::Bridge(
+                        BridgeEvent::Error(format!("[SESSION_INIT_FAILED] {e}")),
+                    ));
+                }
+            }
+            Some(IncomingEvent::ActiveChatChanged {
+                contact_id,
+                is_active: true,
+            })
+        }
+        IncomingEvent::OutgoingMessage {
+            contact_id,
+            message_id,
+            plaintext,
+            content_type,
+        } => {
+            if !orchestrator.has_active_session(&contact_id)
+                && let Err(e) = establish_session(
+                    orchestrator,
+                    storage,
+                    stream_tx,
+                    internal_tx,
+                    grpc,
+                    cursor,
+                    my_user_id,
+                    my_device_id,
+                    self_tx,
+                    timers,
+                    &contact_id,
+                )
+                .await
+            {
+                tracing::error!(
+                    target: "orchestrator_task",
+                    contact_id = %contact_id,
+                    error = %e,
+                    "session init before send failed"
+                );
+                let _ = internal_tx.send(crate::app::InternalEventProxy::Bridge(
+                    BridgeEvent::Error(format!("[SESSION_INIT_FAILED] {e}")),
+                ));
+                return None;
+            }
+            let plaintext = if crate::knst::is_frame(&plaintext) || plaintext.first() == Some(&0) {
+                plaintext
+            } else {
+                crate::knst::encode_text(&String::from_utf8_lossy(&plaintext), &message_id)
+            };
+            Some(IncomingEvent::OutgoingMessage {
+                contact_id,
+                message_id,
+                plaintext,
+                content_type,
+            })
+        }
+        other => Some(other),
+    }
+}
+
+/// Fetch the peer's pre-key bundle and run the existing InitSession dispatch
+/// (INITIATOR vs RESPONDER chosen there). Returns whether a session was created.
+#[allow(clippy::too_many_arguments)]
+async fn establish_session(
+    orchestrator: &mut Orchestrator,
+    storage: &mut Storage,
+    stream_tx: &mpsc::Sender<StreamCmd>,
+    internal_tx: &mpsc::UnboundedSender<crate::app::InternalEventProxy>,
+    grpc: &GrpcClient,
+    cursor: &CursorTracker,
+    my_user_id: &str,
+    my_device_id: &str,
+    self_tx: &mpsc::UnboundedSender<IncomingEvent>,
+    timers: &mut HashMap<String, AbortHandle>,
+    contact_id: &str,
+) -> Result<bool, String> {
+    if orchestrator.has_active_session(contact_id) {
+        return Ok(false);
+    }
+    let bundle_json = fetch_bundle_json(grpc, contact_id)
+        .await
+        .map_err(|e| format!("GetPreKeyBundle: {e:#}"))?;
+    let actions = orchestrator.handle_event(IncomingEvent::KeyBundleFetched {
+        user_id: contact_id.to_string(),
+        bundle_json,
+    });
+    let mut follow_ups = Vec::new();
+    let mut session_inited = std::collections::HashSet::new();
+    for action in actions {
+        dispatch(
+            action,
+            orchestrator,
+            storage,
+            stream_tx,
+            internal_tx,
+            grpc,
+            cursor,
+            my_user_id,
+            my_device_id,
+            self_tx,
+            timers,
+            &mut follow_ups,
+            &mut session_inited,
+        )
+        .await;
+    }
+    for follow_up in follow_ups {
+        let more = orchestrator.handle_event(follow_up);
+        for action in more {
+            dispatch(
+                action,
+                orchestrator,
+                storage,
+                stream_tx,
+                internal_tx,
+                grpc,
+                cursor,
+                my_user_id,
+                my_device_id,
+                self_tx,
+                timers,
+                &mut Vec::new(),
+                &mut session_inited,
+            )
+            .await;
+        }
+    }
+    if orchestrator.has_active_session(contact_id) {
+        Ok(true)
+    } else {
+        Err("no session after InitSession".into())
+    }
+}
+
+fn persist_inbound(
+    storage: &Storage,
+    cursor: &CursorTracker,
+    message_id: &str,
+    msg: crate::storage::StoredMessage,
+) {
+    if storage.store_inbound_message(&msg).is_ok() {
+        cursor.commit(storage, message_id);
+    }
 }
 
 fn build_envelope(
@@ -858,54 +1148,4 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
-}
-
-/// KNST binary frame magic: "KNST" (0x4B 0x4E 0x53 0x54), version 0x01.
-/// Header layout (30 bytes total):
-///   [0..4]  magic
-///   [4]     version (0x01)
-///   [5]     flags   (0x00)
-///   [6..22] message UUID (16 bytes)
-///   [22..24] chunk_index (big-endian u16)
-///   [24..26] total_chunks (big-endian u16)
-///   [26..30] plaintext_length (big-endian u32)
-///   [30..]  payload bytes (protobuf MessageContent for regular messages)
-const KNST_MAGIC: &[u8] = b"KNST";
-const KNST_VERSION: u8 = 0x01;
-const KNST_HEADER_SIZE: usize = 30;
-
-/// Extract displayable text from a decrypted plaintext buffer.
-///
-/// iOS wraps every message in a KNST binary frame containing a protobuf
-/// `shared.proto.messaging.v1.MessageContent`. This function:
-///  1. Strips the 30-byte KNST header if present.
-///  2. Decodes the protobuf payload to extract `text_message.text`.
-///  3. Falls back to lossy UTF-8 if no KNST magic or proto decode fails.
-fn decode_plaintext_text(plaintext: &[u8]) -> String {
-    use crate::proto::messaging::v1::MessageContent;
-
-    // ── Check for KNST frame ──────────────────────────────────────────────────
-    if plaintext.len() >= KNST_HEADER_SIZE
-        && plaintext.starts_with(KNST_MAGIC)
-        && plaintext[4] == KNST_VERSION
-    {
-        let payload = &plaintext[KNST_HEADER_SIZE..];
-
-        // Try protobuf decode first
-        if let Ok(content) = MessageContent::decode(payload) {
-            if let Some(crate::proto::messaging::v1::message_content::Content::Text(text_msg)) =
-                content.content
-            {
-                return text_msg.text;
-            }
-            // Known content type but not a text message (media, reaction, etc.)
-            return String::new();
-        }
-
-        // Proto decode failed — treat payload as raw UTF-8 (legacy path)
-        return String::from_utf8_lossy(payload).into_owned();
-    }
-
-    // ── No KNST frame — raw UTF-8 (TUI↔TUI or control messages) ─────────────
-    String::from_utf8_lossy(plaintext).into_owned()
 }
