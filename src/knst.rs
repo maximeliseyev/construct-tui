@@ -198,7 +198,10 @@ mod tests {
         ));
         let doc: serde_json::Value = serde_json::from_str(VECTORS).expect("vectors are valid JSON");
         let rows = doc["types"].as_array().expect("`types` is an array");
-        assert!(!rows.is_empty(), "empty vectors would pass every assertion below");
+        assert!(
+            !rows.is_empty(),
+            "empty vectors would pass every assertion below"
+        );
 
         for row in rows {
             let value = row["value"].as_u64().expect("value") as u8;
@@ -236,7 +239,10 @@ mod tests {
             );
         }
         let chat = frame_whole(b"", CONTENT_E2EE_SIGNAL, &Uuid::nil().to_string());
-        assert!(is_frame(&chat), "the negative case must exercise the same path");
+        assert!(
+            is_frame(&chat),
+            "the negative case must exercise the same path"
+        );
     }
 
     #[test]
