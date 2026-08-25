@@ -186,7 +186,7 @@ pub enum TokenRefreshMsg {
         refresh_token: String,
         expires_at: i64,
     },
-    /// Network/H3 failure — keep tokens, let the stream reconnect.
+    /// Network transport failure — keep tokens, let the stream reconnect.
     FailedTransport(String),
     /// Refresh token rejected (gRPC 16/7) — device re-auth, do not wipe yet.
     FailedAuth(String),

@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use zeroize::{Zeroize, Zeroizing};
 
 /// Persisted device identity (keys + tokens).
-/// Stored in `~/.config/construct-tui/session.json`.
+/// Stored in `~/.config/construct-tui/session.enc`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     /// Ed25519 device signing key (hex, 64 bytes — private).
@@ -65,19 +65,18 @@ pub enum TransportConfig {
     /// Direct TLS — default for uncensored networks.
     #[default]
     Direct,
-    /// obfs4 obfuscation via construct-ice bridge line.
-    /// Traffic looks like random noise to DPI systems.
+    /// Future VEIL/bridge placeholder. Parsed in config, not wired to transport.
     Obfs4 {
-        /// Full bridge line: `"cert=BASE64 iat-mode=0"` or full obfs4 addr string.
+        /// Bridge configuration string for a future transport connector.
         bridge_line: String,
     },
-    /// obfs4 + outer TLS wrapper — SNI-based CDN fronting.
+    /// Future bridge + outer TLS wrapper placeholder.
     Obfs4Tls {
         bridge_line: String,
-        /// SNI hostname presented in the outer TLS ClientHello.
+        /// SNI hostname for a future outer TLS connector.
         tls_server_name: String,
     },
-    /// Domain fronting through a CDN endpoint.
+    /// Future domain-fronting placeholder.
     CdnFront {
         cdn_endpoint: String,
         sni_host: String,

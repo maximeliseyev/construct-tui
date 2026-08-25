@@ -1,4 +1,4 @@
-//! Errors for the gRPC-over-H3 client.
+//! Errors for the gRPC-over-H2 client.
 //!
 //! Kept as a dedicated type so this module can move to its own crate without
 //! dragging `anyhow` into the public surface.
@@ -57,7 +57,7 @@ impl GrpcError {
         )
     }
 
-    /// QUIC/H3 failure — retry on a fresh connection. Not an auth signal.
+    /// Transport failure — retry on a fresh connection. Not an auth signal.
     pub fn is_retryable_transport(&self) -> bool {
         matches!(self, Self::Transport(_) | Self::Tls(_))
     }

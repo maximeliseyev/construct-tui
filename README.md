@@ -19,6 +19,9 @@ Built with Rust + [Ratatui](https://ratatui.rs). Target platforms: Linux, macOS.
 
 License: [MPL-2.0](LICENSE). Trademark: [TRADEMARK.md](TRADEMARK.md).
 
+Current status: this client is under active development and is not a production-usable
+messenger yet. The next gate is a live 1:1 text exchange with iOS on `ams.konstruct.cc`.
+
 ---
 
 ## Terminal compatibility
@@ -60,7 +63,7 @@ Layout expected by `Cargo.toml`:
 ~/Code/
   construct-tui/       # this repo
   construct-core/      # crypto
-  construct-engine/    # current path dependency — retired from iOS/Android; see AGENTS.md
+  construct-protos/    # prost source of truth
 ```
 
 ---
@@ -80,7 +83,8 @@ cargo build --release --no-default-features
 
 > **Raspberry Pi Zero W:** Kyber-768 handshake can take ~60 s. Use `--no-default-features` on very small boards.
 
-There is no `ice` / obfs4 feature. `construct-ice` was retired in favour of VEIL; the CLI still accepts `--bridge` but it only fills a config label.
+There is no `ice` feature and no `construct-ice` dependency. VEIL is planned later; the
+CLI still accepts `--bridge` / `--bridge-tls-sni`, but those flags are parsed-only today.
 
 Copy a built binary to another machine:
 
@@ -117,7 +121,8 @@ konstruct log-path
 konstruct logout
 ```
 
-`--bridge` / `--bridge-tls-sni`, `--headless`, and `--config` are parsed by clap but **not wired** — they do not change transport, skip the TUI, or load a custom config file.
+`--bridge` / `--bridge-tls-sni`, `--headless`, and `--config` are parsed by clap but
+**not wired** — they do not change transport, skip the TUI, or load a custom config file.
 
 ---
 
@@ -129,7 +134,10 @@ konstruct logout
 
 On subsequent runs the session is loaded from disk and decrypted with the passphrase.
 
-gRPC (register, authenticate, device link, token refresh, pre-key bundle, FindUser, MessageStream) talks QUIC/H3 with system-root TLS. First real send/recv against iOS still needs a live session.
+gRPC (register, authenticate, device link, token refresh, pre-key bundle, FindUser,
+AcceptInvite, MessageStream) talks HTTP/2 over TCP/TLS to `ams.konstruct.cc` with the
+system trust store. QUIC/H3 belongs to `construct-transport` on `quic.konstruct.cc`, not
+this client. First real send/recv against iOS still needs a live session.
 
 ---
 
@@ -211,7 +219,8 @@ There is no CI in this repo (removed 2026-06-19; the project was too early-stage
 - **Messages** are stored in a SQLCipher AES-256 encrypted database.
 - **Signal Protocol** (X3DH + Double Ratchet) + **PQXDH** (Kyber-768) when built with default features.
 
-DPI-bypass (VEIL) is **not** integrated. Transport is gRPC-over-HTTP/3 in `src/grpc/` (ported from construct-engine; extractable later).
+DPI-bypass (VEIL) is **not** integrated. Transport is in-tree gRPC-over-HTTP/2 in
+`src/grpc/` and is kept extractable for a later non-Apple GUI.
 
 ## Trademark
 

@@ -5,19 +5,24 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use prost::Message;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tokio::time::{Instant, MissedTickBehavior};
+use tracing::{debug, info, warn};
 
-use crate::grpc::framing::decode_frame;
+use crate::grpc::framing::{decode_frame, encode_frame};
 use crate::grpc::{GrpcClient, open_message_stream};
-use crate::proto::core::v1::Envelope;
-use crate::proto::services::v1::{MessageStreamResponse, message_stream_response};
+use crate::proto::core::v1::{Envelope, envelope::MessageIdType};
+use crate::proto::services::v1::{
+    Heartbeat, MessageStreamRequest, MessageStreamResponse, SubscribeRequest,
+    message_stream_request, message_stream_response,
+};
 use crate::storage::Storage;
 
 const OUTGOING_BUFFER_CAP: usize = 256;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 
 /// Commands sent **to** the stream handler from the app.
 #[derive(Debug)]
@@ -38,6 +43,19 @@ pub enum StreamEvent {
     },
     Ack {
         message_id: String,
+        stream_cursor: Option<String>,
+    },
+    Heartbeat {
+        timestamp: i64,
+        server_timestamp: i64,
+        stream_cursor: Option<String>,
+    },
+    StreamError {
+        message_id: String,
+        error_code: i32,
+        error_message: String,
+        retryable: bool,
+        retry_after_ms: Option<i64>,
         stream_cursor: Option<String>,
     },
     Connected,
@@ -201,8 +219,22 @@ async fn run_worker(
         info!("message stream connected");
 
         let mut live = true;
+        if let Err(e) = stream.send_frame(encode_heartbeat_frame()).await {
+            warn!("MessageStream heartbeat failed: {e}");
+            live = false;
+        }
+        let mut heartbeat_tick =
+            tokio::time::interval_at(Instant::now() + HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL);
+        heartbeat_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
         while live {
             tokio::select! {
+                _ = heartbeat_tick.tick() => {
+                    if let Err(e) = stream.send_frame(encode_heartbeat_frame()).await {
+                        warn!("MessageStream heartbeat failed: {e}");
+                        live = false;
+                    }
+                }
                 cmd = cmd_rx.recv() => {
                     match cmd {
                         Some(StreamCmd::Send(envelope)) => {
@@ -215,9 +247,6 @@ async fn run_worker(
                         }
                         Some(StreamCmd::Subscribe(ids, sub_cursor)) => {
                             subscribed_users = ids.clone();
-                            use crate::proto::services::v1::{
-                                MessageStreamRequest, SubscribeRequest, message_stream_request,
-                            };
                             let req = MessageStreamRequest {
                                 request: Some(message_stream_request::Request::Subscribe(
                                     SubscribeRequest {
@@ -230,7 +259,7 @@ async fn run_worker(
                                 attempt_id: None,
                             };
                             if let Err(e) = stream
-                                .send_frame(crate::grpc::framing::encode_frame(&req.encode_to_vec()))
+                                .send_frame(encode_frame(&req.encode_to_vec()))
                                 .await
                             {
                                 warn!("stream subscribe failed: {e}");
@@ -274,6 +303,24 @@ fn push_pending(pending: &mut VecDeque<Envelope>, envelope: Envelope) {
         pending.pop_front();
     }
     pending.push_back(envelope);
+}
+
+fn encode_heartbeat_frame() -> bytes::Bytes {
+    let req = MessageStreamRequest {
+        request: Some(message_stream_request::Request::Heartbeat(Heartbeat {
+            timestamp: now_ms(),
+        })),
+        request_id: uuid::Uuid::new_v4().to_string(),
+        attempt_id: None,
+    };
+    encode_frame(&req.encode_to_vec())
+}
+
+fn now_ms() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis() as i64,
+        Err(_) => 0,
+    }
 }
 
 /// Sleep with backoff, draining cmds. `true` means the worker should exit.
@@ -320,15 +367,24 @@ fn backoff_delay(attempt: u32) -> Duration {
 }
 
 async fn dispatch_incoming(frame: bytes::Bytes, event_tx: &mpsc::Sender<StreamEvent>) {
-    let Ok((msg, _)) = decode_frame(frame) else {
-        return;
+    let (msg, _) = match decode_frame(frame) {
+        Ok(decoded) => decoded,
+        Err(e) => {
+            warn!("MessageStream frame decode failed: {e}");
+            return;
+        }
     };
-    let Ok(resp) = MessageStreamResponse::decode(msg.as_ref()) else {
-        return;
+    let resp = match MessageStreamResponse::decode(msg.as_ref()) {
+        Ok(resp) => resp,
+        Err(e) => {
+            warn!("MessageStream response decode failed: {e}");
+            return;
+        }
     };
     let stream_cursor = resp.stream_cursor.clone();
     match resp.response {
         Some(message_stream_response::Response::Message(envelope)) => {
+            log_incoming_envelope(&envelope, stream_cursor.as_deref());
             let _ = event_tx
                 .send(StreamEvent::Message {
                     envelope: Box::new(envelope),
@@ -337,6 +393,13 @@ async fn dispatch_incoming(frame: bytes::Bytes, event_tx: &mpsc::Sender<StreamEv
                 .await;
         }
         Some(message_stream_response::Response::Ack(ack)) => {
+            info!(
+                message_id = %ack.message_id,
+                message_number = ack.message_number,
+                delivery_count = ack.delivery_count,
+                stream_cursor = ?stream_cursor,
+                "MessageStream ack"
+            );
             let _ = event_tx
                 .send(StreamEvent::Ack {
                     message_id: ack.message_id,
@@ -344,7 +407,83 @@ async fn dispatch_incoming(frame: bytes::Bytes, event_tx: &mpsc::Sender<StreamEv
                 })
                 .await;
         }
-        _ => {}
+        Some(message_stream_response::Response::HeartbeatAck(ack)) => {
+            info!(
+                timestamp = ack.timestamp,
+                server_timestamp = ack.server_timestamp,
+                stream_cursor = ?stream_cursor,
+                "MessageStream heartbeat ack"
+            );
+            let _ = event_tx
+                .send(StreamEvent::Heartbeat {
+                    timestamp: ack.timestamp,
+                    server_timestamp: ack.server_timestamp,
+                    stream_cursor,
+                })
+                .await;
+        }
+        Some(message_stream_response::Response::Error(error)) => {
+            warn!(
+                message_id = %error.message_id,
+                error_code = error.error_code,
+                retryable = error.retryable,
+                retry_after_ms = ?error.retry_after_ms,
+                stream_cursor = ?stream_cursor,
+                "MessageStream error: {}",
+                error.error_message
+            );
+            let _ = event_tx
+                .send(StreamEvent::StreamError {
+                    message_id: error.message_id,
+                    error_code: error.error_code,
+                    error_message: error.error_message,
+                    retryable: error.retryable,
+                    retry_after_ms: error.retry_after_ms,
+                    stream_cursor,
+                })
+                .await;
+        }
+        Some(message_stream_response::Response::Receipt(_)) => {
+            debug!("MessageStream receipt ignored");
+        }
+        Some(message_stream_response::Response::Typing(_)) => {
+            debug!("MessageStream typing indicator ignored");
+        }
+        Some(message_stream_response::Response::Presence(_)) => {
+            debug!("MessageStream presence update ignored");
+        }
+        Some(message_stream_response::Response::P2pHandoff(_)) => {
+            debug!("MessageStream P2P handoff ignored");
+        }
+        None => warn!("MessageStream response missing response oneof"),
+    }
+}
+
+fn log_incoming_envelope(envelope: &Envelope, stream_cursor: Option<&str>) {
+    info!(
+        message_id = %envelope_message_id(envelope),
+        sender = %envelope
+            .sender
+            .as_ref()
+            .map(|sender| sender.user_id.as_str())
+            .unwrap_or(""),
+        recipient = %envelope
+            .recipient
+            .as_ref()
+            .map(|recipient| recipient.user_id.as_str())
+            .unwrap_or(""),
+        content_type = envelope.content_type,
+        payload_len = envelope.encrypted_payload.len(),
+        has_sealed_sender = envelope.sealed_sender.is_some(),
+        stream_cursor = ?stream_cursor,
+        "MessageStream incoming envelope"
+    );
+}
+
+fn envelope_message_id(envelope: &Envelope) -> &str {
+    match &envelope.message_id_type {
+        Some(MessageIdType::MessageId(id)) => id,
+        Some(MessageIdType::GroupMessageId(_)) | None => "",
     }
 }
 
@@ -367,6 +506,7 @@ pub fn encode_envelope(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::services::v1::{HeartbeatAck, MessageError};
 
     #[test]
     fn backoff_caps_at_sixty() {
@@ -393,5 +533,87 @@ mod tests {
             event_rx.try_recv(),
             Ok(StreamEvent::Reconnecting { .. })
         ));
+    }
+
+    #[test]
+    fn heartbeat_frame_encodes_stream_heartbeat_request() {
+        let frame = encode_heartbeat_frame();
+        let (msg, _) = decode_frame(frame).expect("heartbeat frame should decode");
+        let req =
+            MessageStreamRequest::decode(msg.as_ref()).expect("heartbeat request should decode");
+
+        match req.request {
+            Some(message_stream_request::Request::Heartbeat(heartbeat)) => {
+                assert!(heartbeat.timestamp > 0);
+            }
+            other => panic!("expected heartbeat request, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_heartbeat_ack() {
+        let (event_tx, mut event_rx) = mpsc::channel::<StreamEvent>(1);
+        let resp = MessageStreamResponse {
+            response: Some(message_stream_response::Response::HeartbeatAck(
+                HeartbeatAck {
+                    timestamp: 10,
+                    server_timestamp: 20,
+                },
+            )),
+            stream_cursor: Some("cursor-1".to_string()),
+            ..Default::default()
+        };
+
+        dispatch_incoming(encode_frame(&resp.encode_to_vec()), &event_tx).await;
+
+        match event_rx.try_recv() {
+            Ok(StreamEvent::Heartbeat {
+                timestamp,
+                server_timestamp,
+                stream_cursor,
+            }) => {
+                assert_eq!(timestamp, 10);
+                assert_eq!(server_timestamp, 20);
+                assert_eq!(stream_cursor.as_deref(), Some("cursor-1"));
+            }
+            other => panic!("expected heartbeat event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_stream_error() {
+        let (event_tx, mut event_rx) = mpsc::channel::<StreamEvent>(1);
+        let resp = MessageStreamResponse {
+            response: Some(message_stream_response::Response::Error(MessageError {
+                message_id: "msg-1".to_string(),
+                error_code: 7,
+                error_message: "denied".to_string(),
+                retryable: true,
+                retry_after_ms: Some(500),
+            })),
+            stream_cursor: Some("cursor-2".to_string()),
+            ..Default::default()
+        };
+
+        dispatch_incoming(encode_frame(&resp.encode_to_vec()), &event_tx).await;
+
+        match event_rx.try_recv() {
+            Ok(StreamEvent::StreamError {
+                message_id,
+                error_code,
+                error_message,
+                retryable,
+                retry_after_ms,
+                stream_cursor,
+            }) => {
+                assert_eq!(message_id, "msg-1");
+                assert_eq!(error_code, 7);
+                assert_eq!(error_message, "denied");
+                assert!(retryable);
+                assert_eq!(retry_after_ms, Some(500));
+                assert_eq!(stream_cursor.as_deref(), Some("cursor-2"));
+            }
+            other => panic!("expected stream error event, got {other:?}"),
+        }
     }
 }

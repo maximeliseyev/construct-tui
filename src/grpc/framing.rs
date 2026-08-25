@@ -1,11 +1,11 @@
-//! gRPC-over-HTTP/3 length-prefix framing.
+//! gRPC length-prefix framing.
 //!
 //! Wire format (identical over H2 and H3):
 //!   1 byte  — compression flag (0 = uncompressed)
 //!   4 bytes — message length (big-endian u32)
 //!   N bytes — protobuf body
 //!
-//! Ported from construct-engine `transport/grpc.rs`.
+//! Shared gRPC message framing; the TUI transport currently carries it over HTTP/2.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 

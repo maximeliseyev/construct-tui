@@ -31,26 +31,26 @@ struct Cli {
     #[arg(long)]
     server: Option<String>,
 
-    /// obfs4 bridge line — enables ICE (obfs4) DPI-bypass transport.
-    /// Format: "cert=BASE64 iat-mode=0" or full bridge string.
+    /// Parsed-only bridge setting reserved for future VEIL transport.
+    /// Currently does not change network behaviour.
     #[arg(long)]
     bridge: Option<String>,
 
-    /// SNI hostname for the outer TLS wrapper (requires --bridge).
-    /// Use with a CDN SNI to defeat SNI-based blocking.
+    /// Parsed-only SNI setting reserved for future VEIL transport.
+    /// Currently does not change network behaviour.
     #[arg(long)]
     bridge_tls_sni: Option<String>,
 
-    /// Disable session encryption at-rest (for headless / systemd deployments).
+    /// Disable session encryption at-rest.
     /// Has the same effect as the CONSTRUCT_NO_ENCRYPT environment variable.
     #[arg(long)]
     no_encrypt: bool,
 
-    /// Run as a headless daemon — receive messages without a terminal UI.
+    /// Parsed-only headless flag. The Ratatui UI still starts today.
     #[arg(long)]
     headless: bool,
 
-    /// Path to a custom config file (default: ~/.config/construct-tui/config.json).
+    /// Parsed-only custom config path. The default config path is still used today.
     #[arg(long)]
     config: Option<String>,
 
