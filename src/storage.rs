@@ -327,6 +327,16 @@ impl Storage {
         Ok(())
     }
 
+    /// Store non-empty data, or delete the key when the core sends its empty
+    /// payload delete sentinel.
+    pub fn secure_save_or_delete(&self, key: &str, value: &[u8]) -> Result<()> {
+        if value.is_empty() {
+            self.secure_delete(key)
+        } else {
+            self.secure_save(key, value)
+        }
+    }
+
     pub fn secure_load(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let mut stmt = self
             .conn
@@ -461,6 +471,14 @@ mod tests {
         s.secure_save("session_key", b"secret").unwrap();
         let val = s.secure_load("session_key").unwrap();
         assert_eq!(val.as_deref(), Some(b"secret".as_ref()));
+    }
+
+    #[test]
+    fn secure_save_or_delete_treats_empty_value_as_delete_sentinel() {
+        let s = Storage::open_in_memory().unwrap();
+        s.secure_save("session_alice", b"secret").unwrap();
+        s.secure_save_or_delete("session_alice", b"").unwrap();
+        assert_eq!(s.secure_load("session_alice").unwrap(), None);
     }
 
     #[test]

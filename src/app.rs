@@ -726,6 +726,59 @@ impl App {
                 Vec::new()
             }
         };
+
+        // Restore core coordination state and per-contact DR material before
+        // the stream worker can redeliver old envelopes. Without this, the TUI
+        // starts the core with an empty session map while secure_store still
+        // contains `session_<uuid>` / `archive_<uuid>` bytes.
+        match read_storage.secure_load("construct.orchestrator_state") {
+            Ok(Some(state)) if !state.is_empty() => {
+                if let Err(e) = orchestrator.import_orchestrator_state_cfe(&state) {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to restore orchestrator coordination state"
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                error = %e,
+                "failed to load orchestrator coordination state"
+            ),
+        }
+        for contact_id in &contact_ids {
+            for key in [
+                format!("archive_{contact_id}"),
+                format!("session_{contact_id}"),
+            ] {
+                let data = match read_storage.secure_load(&key) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        tracing::warn!(
+                            contact_id = %contact_id,
+                            key = %key,
+                            error = %e,
+                            "failed to load persisted session material"
+                        );
+                        None
+                    }
+                };
+                let actions = orchestrator.handle_event(
+                    construct_core::orchestration::actions::IncomingEvent::SessionLoaded {
+                        key,
+                        data,
+                    },
+                );
+                if !actions.is_empty() {
+                    tracing::warn!(
+                        contact_id = %contact_id,
+                        action_count = actions.len(),
+                        "SessionLoaded produced unexpected startup actions"
+                    );
+                }
+            }
+        }
+
         self.read_storage = Some(read_storage);
 
         // ── Generate OTPKs before moving orchestrator into task ───────────────
@@ -1653,13 +1706,8 @@ impl App {
                 identity_key_b64: String::new(),
             });
         }
-        if let Some(ref tx) = self.stream_tx {
-            let _ = tx.try_send(crate::streaming::StreamCmd::Subscribe(
-                vec![user_id.clone()],
-                None,
-            ));
-        }
         self.chat_list.add_contact(new_contact);
+        self.resubscribe_stream_to_contacts();
         if let Some(ref orch) = self.orch_handle {
             orch.send(
                 construct_core::orchestration::actions::IncomingEvent::ActiveChatChanged {
@@ -1671,6 +1719,21 @@ impl App {
         self.status = format!("Added @{username} — opening session");
         self.contact_search.reset();
         self.screen = Screen::Main;
+    }
+
+    fn resubscribe_stream_to_contacts(&self) {
+        let Some(ref stream_tx) = self.stream_tx else {
+            return;
+        };
+        let contact_ids = contact_ids_for_stream(&self.chat_list.contacts);
+        let stream_cursor = self
+            .read_storage
+            .as_ref()
+            .and_then(|storage| storage.load_stream_cursor().ok().flatten());
+        let _ = stream_tx.try_send(crate::streaming::StreamCmd::Subscribe(
+            contact_ids,
+            stream_cursor,
+        ));
     }
 
     fn redeem_pasted_invite(&mut self, raw: &str) {
@@ -1729,9 +1792,13 @@ impl App {
             self.status = format!("Delete failed: {e}");
             return;
         }
+        if let Some(ref orch) = self.orch_handle {
+            orch.forget_contact(peer_id.clone());
+        }
         if let Some(i) = idx {
             self.chat_list.remove_at(i);
         }
+        self.resubscribe_stream_to_contacts();
         // Clear chat view if it was showing the deleted contact.
         if self.chat_view.contact_name == peer_id
             || self.chat_list.contacts.iter().all(|c| c.id != peer_id)
@@ -2092,6 +2159,10 @@ fn direct_envelope_message_id(envelope: &crate::proto::core::v1::Envelope) -> &s
     }
 }
 
+fn contact_ids_for_stream(contacts: &[Contact]) -> Vec<String> {
+    contacts.iter().map(|contact| contact.id.clone()).collect()
+}
+
 fn current_time_hhmm() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2122,6 +2193,29 @@ mod tests {
     use super::*;
     use construct_core::crypto::provider::CryptoProvider;
     use construct_core::crypto::suites::classic::ClassicSuiteProvider;
+
+    #[test]
+    fn stream_resubscribe_uses_the_full_contact_set() {
+        let contacts = vec![
+            Contact {
+                id: "alice".to_string(),
+                display_name: "Alice".to_string(),
+                unread: 0,
+                last_message: None,
+            },
+            Contact {
+                id: "bob".to_string(),
+                display_name: "Bob".to_string(),
+                unread: 0,
+                last_message: None,
+            },
+        ];
+
+        assert_eq!(
+            contact_ids_for_stream(&contacts),
+            vec!["alice".to_string(), "bob".to_string()]
+        );
+    }
 
     #[test]
     fn resolves_sealed_envelope_from_inner_payload_and_sender_cert() {

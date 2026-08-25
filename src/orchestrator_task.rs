@@ -40,6 +40,7 @@ use crate::streaming::{CursorTracker, StreamCmd};
 #[derive(Clone)]
 pub struct OrchestratorHandle {
     pub tx: mpsc::UnboundedSender<IncomingEvent>,
+    cmd_tx: mpsc::UnboundedSender<OrchestratorCommand>,
 }
 
 impl OrchestratorHandle {
@@ -47,6 +48,18 @@ impl OrchestratorHandle {
     pub fn send(&self, event: IncomingEvent) {
         let _ = self.tx.send(event);
     }
+
+    /// Drop volatile session state for a contact that the user removed locally.
+    pub fn forget_contact(&self, contact_id: String) {
+        let _ = self
+            .cmd_tx
+            .send(OrchestratorCommand::ForgetContact { contact_id });
+    }
+}
+
+#[derive(Debug, Clone)]
+enum OrchestratorCommand {
+    ForgetContact { contact_id: String },
 }
 
 // ── Startup ───────────────────────────────────────────────────────────────────
@@ -72,7 +85,11 @@ pub fn spawn_orchestrator_task(
     my_device_id: String,
 ) -> OrchestratorHandle {
     let (tx, rx) = mpsc::unbounded_channel::<IncomingEvent>();
-    let handle = OrchestratorHandle { tx: tx.clone() };
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<OrchestratorCommand>();
+    let handle = OrchestratorHandle {
+        tx: tx.clone(),
+        cmd_tx,
+    };
 
     tokio::spawn(run(
         orchestrator,
@@ -85,6 +102,7 @@ pub fn spawn_orchestrator_task(
         my_device_id,
         tx,
         rx,
+        cmd_rx,
     ));
 
     handle
@@ -104,10 +122,40 @@ async fn run(
     my_device_id: String,
     self_tx: mpsc::UnboundedSender<IncomingEvent>,
     mut rx: mpsc::UnboundedReceiver<IncomingEvent>,
+    mut cmd_rx: mpsc::UnboundedReceiver<OrchestratorCommand>,
 ) {
     let mut timers: HashMap<String, AbortHandle> = HashMap::new();
 
-    while let Some(event) = rx.recv().await {
+    loop {
+        let event = tokio::select! {
+            maybe_cmd = cmd_rx.recv() => {
+                let Some(cmd) = maybe_cmd else {
+                    break;
+                };
+                handle_command(
+                    cmd,
+                    &mut orchestrator,
+                    &mut storage,
+                    &stream_tx,
+                    &internal_tx,
+                    &grpc,
+                    &cursor,
+                    &my_user_id,
+                    &my_device_id,
+                    &self_tx,
+                    &mut timers,
+                )
+                .await;
+                continue;
+            }
+            maybe_event = rx.recv() => {
+                let Some(event) = maybe_event else {
+                    break;
+                };
+                event
+            }
+        };
+
         let event = match prepare_outgoing(
             event,
             &mut orchestrator,
@@ -185,6 +233,101 @@ async fn run(
 }
 
 // ── Action dispatch ───────────────────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_command(
+    command: OrchestratorCommand,
+    orchestrator: &mut Orchestrator,
+    storage: &mut Storage,
+    stream_tx: &mpsc::Sender<StreamCmd>,
+    internal_tx: &mpsc::UnboundedSender<crate::app::InternalEventProxy>,
+    grpc: &GrpcClient,
+    cursor: &CursorTracker,
+    my_user_id: &str,
+    my_device_id: &str,
+    self_tx: &mpsc::UnboundedSender<IncomingEvent>,
+    timers: &mut HashMap<String, AbortHandle>,
+) {
+    match command {
+        OrchestratorCommand::ForgetContact { contact_id } => {
+            let actions = orchestrator.handle_event(IncomingEvent::ActiveChatChanged {
+                contact_id: contact_id.clone(),
+                is_active: false,
+            });
+            let mut follow_ups = Vec::new();
+            let mut session_inited = std::collections::HashSet::new();
+            for action in actions {
+                dispatch(
+                    action,
+                    orchestrator,
+                    storage,
+                    stream_tx,
+                    internal_tx,
+                    grpc,
+                    cursor,
+                    my_user_id,
+                    my_device_id,
+                    self_tx,
+                    timers,
+                    &mut follow_ups,
+                    &mut session_inited,
+                )
+                .await;
+            }
+
+            let had_active_session = orchestrator.remove_session_by_contact(&contact_id);
+            orchestrator.clear_heal_record(&contact_id);
+            match orchestrator.export_orchestrator_state_cfe() {
+                Ok(state) => {
+                    if let Err(e) =
+                        storage.secure_save_or_delete("construct.orchestrator_state", &state)
+                    {
+                        tracing::warn!(
+                            target: "orchestrator_task",
+                            contact_id = %contact_id,
+                            error = %e,
+                            "forget_contact: failed to persist orchestrator state"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    target: "orchestrator_task",
+                    contact_id = %contact_id,
+                    error = %e,
+                    "forget_contact: failed to export orchestrator state"
+                ),
+            }
+
+            let session_key = format!("session_{contact_id}");
+            if let Err(e) = storage.secure_delete(&session_key) {
+                tracing::warn!(
+                    target: "orchestrator_task",
+                    contact_id = %contact_id,
+                    key = %session_key,
+                    error = %e,
+                    "forget_contact: failed to delete hot session key"
+                );
+            }
+            let archive_key = format!("archive_{contact_id}");
+            if let Err(e) = storage.secure_delete(&archive_key) {
+                tracing::warn!(
+                    target: "orchestrator_task",
+                    contact_id = %contact_id,
+                    key = %archive_key,
+                    error = %e,
+                    "forget_contact: failed to delete archive session key"
+                );
+            }
+
+            tracing::info!(
+                target: "orchestrator_task",
+                contact_id = %contact_id,
+                had_active_session,
+                "forgot contact session material"
+            );
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
@@ -584,7 +727,14 @@ async fn dispatch(
 
         // ── Persistence ─────────────────────────────────────────────────────
         Action::SaveSessionToSecureStore { key, data } => {
-            let _ = storage.secure_save(&key, &data);
+            if let Err(e) = apply_secure_store_save(storage, &key, &data) {
+                tracing::warn!(
+                    target: "orchestrator_task",
+                    key = %key,
+                    error = %e,
+                    "SaveSessionToSecureStore failed"
+                );
+            }
         }
 
         Action::LoadSessionFromSecureStore { key } => {
@@ -770,14 +920,41 @@ async fn dispatch(
             }
         }
 
-        Action::SessionTerminated { contact_id, .. } => {
+        Action::SessionTerminated {
+            contact_id,
+            archive_bytes,
+        } => {
+            if let Err(e) = apply_session_terminated(storage, &contact_id, &archive_bytes) {
+                tracing::warn!(
+                    target: "orchestrator_task",
+                    contact_id = %contact_id,
+                    error = %e,
+                    "SessionTerminated storage update failed"
+                );
+            }
             tracing::info!(
                 target: "orchestrator_task",
                 contact_id = %contact_id,
-                "Session terminated (archive stored by orchestrator)"
+                "Session terminated"
             );
         }
     }
+}
+
+fn apply_secure_store_save(storage: &Storage, key: &str, data: &[u8]) -> Result<()> {
+    storage.secure_save_or_delete(key, data)
+}
+
+fn apply_session_terminated(
+    storage: &Storage,
+    contact_id: &str,
+    archive_bytes: &[u8],
+) -> Result<()> {
+    let archive_key = format!("archive_{contact_id}");
+    storage.secure_save(&archive_key, archive_bytes)?;
+    let session_key = format!("session_{contact_id}");
+    storage.secure_delete(&session_key)?;
+    Ok(())
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1148,4 +1325,36 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secure_store_save_action_deletes_empty_payload() {
+        let storage = Storage::open_in_memory().expect("in-memory storage opens");
+        apply_secure_store_save(&storage, "session_peer", b"old-session")
+            .expect("initial session save succeeds");
+        apply_secure_store_save(&storage, "session_peer", b"").expect("delete sentinel succeeds");
+
+        assert_eq!(storage.secure_load("session_peer").unwrap(), None);
+    }
+
+    #[test]
+    fn session_terminated_archives_and_deletes_hot_session() {
+        let storage = Storage::open_in_memory().expect("in-memory storage opens");
+        storage
+            .secure_save("session_peer", b"hot-session")
+            .expect("hot session fixture saves");
+
+        apply_session_terminated(&storage, "peer", b"archive-session")
+            .expect("session termination storage contract succeeds");
+
+        assert_eq!(
+            storage.secure_load("archive_peer").unwrap().as_deref(),
+            Some(b"archive-session".as_ref())
+        );
+        assert_eq!(storage.secure_load("session_peer").unwrap(), None);
+    }
 }

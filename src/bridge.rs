@@ -141,8 +141,13 @@ impl TuiBridge {
 
 impl PlatformBridge for TuiBridge {
     fn save_to_secure_store(&self, key: String, data: Vec<u8>) {
-        if let Err(e) = self.storage.lock().unwrap().secure_save(&key, &data) {
-            eprintln!("[bridge] secure_save({key}): {e}");
+        if let Err(e) = self
+            .storage
+            .lock()
+            .unwrap()
+            .secure_save_or_delete(&key, &data)
+        {
+            eprintln!("[bridge] secure_save_or_delete({key}): {e}");
         }
     }
 
