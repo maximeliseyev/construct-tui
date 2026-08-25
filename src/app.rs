@@ -626,7 +626,7 @@ impl App {
         device_id: String,
         _access_token: String,
     ) {
-        use crate::orchestrator_task::spawn_orchestrator_task;
+        use crate::orchestrator_task::{StreamMessageContext, spawn_orchestrator_task};
         use crate::storage::Storage;
         use crate::streaming::{CursorTracker, StreamEvent, spawn_stream_worker};
         use construct_core::{
@@ -829,6 +829,7 @@ impl App {
 
         // Relay stream events to the Orchestrator.
         let orch_tx = orch_handle.tx.clone();
+        let orch_stream = orch_handle.clone();
         let internal_tx = self.internal_tx.clone();
         tokio::spawn(async move {
             while let Some(event) = stream_rx.recv().await {
@@ -863,36 +864,78 @@ impl App {
                             );
                         }
 
-                        match construct_core::wire_payload::unpack(&inbound.wire_payload) {
+                        let message_id = inbound.message_id;
+                        let from = inbound.from;
+                        let content_type = inbound.content_type;
+                        let wire_payload = inbound.wire_payload;
+                        let is_sealed = inbound.is_sealed;
+
+                        match construct_core::wire_payload::unpack(&wire_payload) {
                             Ok(decoded) => {
-                                cursor.note(&inbound.message_id, stream_cursor);
-                                let is_control = matches!(
-                                    inbound.content_type,
-                                    21 | 24 // SESSION_RESET | SESSION_RESET_INIT
-                                );
-                                let _ = orch_tx.send(
+                                let is_control = is_session_reset_control_type(content_type);
+                                let msg_num = decoded.message_number;
+                                orch_stream.stream_message(
                                     construct_core::orchestration::actions::IncomingEvent::MessageReceived {
-                                        message_id: inbound.message_id,
-                                        from: inbound.from,
-                                        data: inbound.wire_payload,
-                                        msg_num: decoded.message_number,
+                                        message_id: message_id.clone(),
+                                        from: from.clone(),
+                                        data: wire_payload,
+                                        msg_num,
                                         kem_ct: decoded.kem_ciphertext.unwrap_or_default(),
                                         otpk_id: decoded.one_time_prekey_id,
                                         is_control,
-                                        content_type: inbound.content_type,
+                                        content_type,
+                                    },
+                                    StreamMessageContext {
+                                        contact_id: from,
+                                        message_id,
+                                        stream_cursor,
+                                        content_type,
+                                        msg_num,
                                     },
                                 );
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    message_id = %inbound.message_id,
-                                    sender = %inbound.from,
-                                    content_type = inbound.content_type,
-                                    payload_len = inbound.wire_payload.len(),
-                                    has_sealed_sender = inbound.is_sealed,
-                                    stream_cursor = ?stream_cursor,
-                                    "incoming envelope dropped: wire payload unpack failed: {e}"
-                                );
+                                let is_reset_control = is_session_reset_control_type(content_type);
+                                if is_reset_control {
+                                    tracing::warn!(
+                                        message_id = %message_id,
+                                        sender = %from,
+                                        content_type,
+                                        payload_len = wire_payload.len(),
+                                        has_sealed_sender = is_sealed,
+                                        stream_cursor = ?stream_cursor,
+                                        "incoming reset control routed without wire payload decode: {e}"
+                                    );
+                                    orch_stream.stream_message(
+                                        construct_core::orchestration::actions::IncomingEvent::MessageReceived {
+                                            message_id: message_id.clone(),
+                                            from: from.clone(),
+                                            data: wire_payload,
+                                            msg_num: 0,
+                                            kem_ct: Vec::new(),
+                                            otpk_id: 0,
+                                            is_control: true,
+                                            content_type,
+                                        },
+                                        StreamMessageContext {
+                                            contact_id: from,
+                                            message_id,
+                                            stream_cursor,
+                                            content_type,
+                                            msg_num: 0,
+                                        },
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        message_id = %message_id,
+                                        sender = %from,
+                                        content_type,
+                                        payload_len = wire_payload.len(),
+                                        has_sealed_sender = is_sealed,
+                                        stream_cursor = ?stream_cursor,
+                                        "incoming envelope dropped: wire payload unpack failed: {e}"
+                                    );
+                                }
                             }
                         }
                     }
@@ -2152,6 +2195,11 @@ fn content_type_to_u8(content_type: i32) -> u8 {
     u8::try_from(content_type).unwrap_or_default()
 }
 
+fn is_session_reset_control_type(content_type: u8) -> bool {
+    content_type == crate::proto::core::v1::ContentType::SessionReset as u8
+        || content_type == crate::proto::core::v1::ContentType::SessionResetInit as u8
+}
+
 fn direct_envelope_message_id(envelope: &crate::proto::core::v1::Envelope) -> &str {
     match &envelope.message_id_type {
         Some(crate::proto::core::v1::envelope::MessageIdType::MessageId(id)) => id,
@@ -2215,6 +2263,22 @@ mod tests {
             contact_ids_for_stream(&contacts),
             vec!["alice".to_string(), "bob".to_string()]
         );
+    }
+
+    #[test]
+    fn invalid_wire_payload_with_reset_type_is_routed_as_control() {
+        let invalid_wire_payload = b"not-a-wire-payload";
+
+        assert!(construct_core::wire_payload::unpack(invalid_wire_payload).is_err());
+        assert!(is_session_reset_control_type(
+            crate::proto::core::v1::ContentType::SessionReset as u8
+        ));
+        assert!(is_session_reset_control_type(
+            crate::proto::core::v1::ContentType::SessionResetInit as u8
+        ));
+        assert!(!is_session_reset_control_type(
+            crate::proto::core::v1::ContentType::E2eeSignal as u8
+        ));
     }
 
     #[test]

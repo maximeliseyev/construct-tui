@@ -55,11 +55,41 @@ impl OrchestratorHandle {
             .cmd_tx
             .send(OrchestratorCommand::ForgetContact { contact_id });
     }
+
+    /// Route an inbound stream message with its server cursor context.
+    pub(crate) fn stream_message(&self, event: IncomingEvent, context: StreamMessageContext) {
+        let _ = self
+            .cmd_tx
+            .send(OrchestratorCommand::StreamMessage { event, context });
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StreamMessageContext {
+    pub contact_id: String,
+    pub message_id: String,
+    pub stream_cursor: Option<String>,
+    pub content_type: u8,
+    pub msg_num: u32,
+}
+
+impl StreamMessageContext {
+    fn is_replay_sensitive(&self) -> bool {
+        self.msg_num == 0
+            || self.content_type == ContentType::SessionReset as u8
+            || self.content_type == ContentType::SessionResetInit as u8
+    }
 }
 
 #[derive(Debug, Clone)]
 enum OrchestratorCommand {
-    ForgetContact { contact_id: String },
+    ForgetContact {
+        contact_id: String,
+    },
+    StreamMessage {
+        event: IncomingEvent,
+        context: StreamMessageContext,
+    },
 }
 
 // ── Startup ───────────────────────────────────────────────────────────────────
@@ -125,6 +155,7 @@ async fn run(
     mut cmd_rx: mpsc::UnboundedReceiver<OrchestratorCommand>,
 ) {
     let mut timers: HashMap<String, AbortHandle> = HashMap::new();
+    let mut session_established_at_ms: HashMap<String, u64> = HashMap::new();
 
     loop {
         let event = tokio::select! {
@@ -144,6 +175,7 @@ async fn run(
                     &my_device_id,
                     &self_tx,
                     &mut timers,
+                    &mut session_established_at_ms,
                 )
                 .await;
                 continue;
@@ -168,6 +200,7 @@ async fn run(
             &my_device_id,
             &self_tx,
             &mut timers,
+            &mut session_established_at_ms,
         )
         .await
         {
@@ -199,6 +232,7 @@ async fn run(
                 &mut timers,
                 &mut follow_ups,
                 &mut session_inited,
+                &mut session_established_at_ms,
             )
             .await;
         }
@@ -225,6 +259,7 @@ async fn run(
                     &mut timers,
                     &mut Vec::new(),     // no further follow-up nesting
                     &mut session_inited, // share dedup context with follow-ups
+                    &mut session_established_at_ms,
                 )
                 .await;
             }
@@ -247,6 +282,7 @@ async fn handle_command(
     my_device_id: &str,
     self_tx: &mpsc::UnboundedSender<IncomingEvent>,
     timers: &mut HashMap<String, AbortHandle>,
+    session_established_at_ms: &mut HashMap<String, u64>,
 ) {
     match command {
         OrchestratorCommand::ForgetContact { contact_id } => {
@@ -271,12 +307,14 @@ async fn handle_command(
                     timers,
                     &mut follow_ups,
                     &mut session_inited,
+                    session_established_at_ms,
                 )
                 .await;
             }
 
-            let had_active_session = orchestrator.remove_session_by_contact(&contact_id);
-            orchestrator.clear_heal_record(&contact_id);
+            let had_active_session = orchestrator.has_active_session(&contact_id);
+            orchestrator.forget_contact_state(&contact_id);
+            session_established_at_ms.remove(&contact_id);
             match orchestrator.export_orchestrator_state_cfe() {
                 Ok(state) => {
                     if let Err(e) =
@@ -326,6 +364,67 @@ async fn handle_command(
                 "forgot contact session material"
             );
         }
+        OrchestratorCommand::StreamMessage { event, context } => {
+            if should_drop_stale_session_replay(&context, session_established_at_ms) {
+                cursor.commit_direct(storage, context.stream_cursor.clone());
+                tracing::warn!(
+                    target: "orchestrator_task",
+                    contact_id = %context.contact_id,
+                    message_id = %context.message_id,
+                    content_type = context.content_type,
+                    msg_num = context.msg_num,
+                    stream_cursor = ?context.stream_cursor,
+                    "dropped stale replay-sensitive stream message"
+                );
+                return;
+            }
+
+            cursor.note(&context.message_id, context.stream_cursor);
+            let actions = orchestrator.handle_event(event);
+            let mut follow_ups: Vec<IncomingEvent> = Vec::new();
+            let mut session_inited = std::collections::HashSet::new();
+            for action in actions {
+                dispatch(
+                    action,
+                    orchestrator,
+                    storage,
+                    stream_tx,
+                    internal_tx,
+                    grpc,
+                    cursor,
+                    my_user_id,
+                    my_device_id,
+                    self_tx,
+                    timers,
+                    &mut follow_ups,
+                    &mut session_inited,
+                    session_established_at_ms,
+                )
+                .await;
+            }
+            for follow_up in follow_ups {
+                let more = orchestrator.handle_event(follow_up);
+                for action in more {
+                    dispatch(
+                        action,
+                        orchestrator,
+                        storage,
+                        stream_tx,
+                        internal_tx,
+                        grpc,
+                        cursor,
+                        my_user_id,
+                        my_device_id,
+                        self_tx,
+                        timers,
+                        &mut Vec::new(),
+                        &mut session_inited,
+                        session_established_at_ms,
+                    )
+                    .await;
+                }
+            }
+        }
     }
 }
 
@@ -344,6 +443,7 @@ async fn dispatch(
     timers: &mut HashMap<String, AbortHandle>,
     follow_ups: &mut Vec<IncomingEvent>,
     session_inited: &mut std::collections::HashSet<String>,
+    session_established_at_ms: &mut HashMap<String, u64>,
 ) {
     match action {
         // ── Crypto (platform must handle synchronously) ────────────────────
@@ -467,6 +567,7 @@ async fn dispatch(
                 return;
             }
             session_inited.insert(contact_id.clone());
+            session_established_at_ms.insert(contact_id.clone(), now_ms_u64());
             follow_ups.push(IncomingEvent::SessionInitCompleted {
                 contact_id,
                 session_data: vec![],
@@ -932,6 +1033,7 @@ async fn dispatch(
                     "SessionTerminated storage update failed"
                 );
             }
+            session_established_at_ms.remove(&contact_id);
             tracing::info!(
                 target: "orchestrator_task",
                 contact_id = %contact_id,
@@ -1018,6 +1120,7 @@ async fn prepare_outgoing(
     my_device_id: &str,
     self_tx: &mpsc::UnboundedSender<IncomingEvent>,
     timers: &mut HashMap<String, AbortHandle>,
+    session_established_at_ms: &mut HashMap<String, u64>,
 ) -> Option<IncomingEvent> {
     match event {
         IncomingEvent::ActiveChatChanged {
@@ -1036,6 +1139,7 @@ async fn prepare_outgoing(
                 my_device_id,
                 self_tx,
                 timers,
+                session_established_at_ms,
                 &contact_id,
             )
             .await
@@ -1070,6 +1174,7 @@ async fn prepare_outgoing(
                                 timers,
                                 &mut follow_ups,
                                 &mut session_inited,
+                                session_established_at_ms,
                             )
                             .await;
                         }
@@ -1111,6 +1216,7 @@ async fn prepare_outgoing(
                     my_device_id,
                     self_tx,
                     timers,
+                    session_established_at_ms,
                     &contact_id,
                 )
                 .await
@@ -1156,6 +1262,7 @@ async fn establish_session(
     my_device_id: &str,
     self_tx: &mpsc::UnboundedSender<IncomingEvent>,
     timers: &mut HashMap<String, AbortHandle>,
+    session_established_at_ms: &mut HashMap<String, u64>,
     contact_id: &str,
 ) -> Result<bool, String> {
     if orchestrator.has_active_session(contact_id) {
@@ -1185,6 +1292,7 @@ async fn establish_session(
             timers,
             &mut follow_ups,
             &mut session_inited,
+            session_established_at_ms,
         )
         .await;
     }
@@ -1205,6 +1313,7 @@ async fn establish_session(
                 timers,
                 &mut Vec::new(),
                 &mut session_inited,
+                session_established_at_ms,
             )
             .await;
         }
@@ -1300,6 +1409,28 @@ fn content_type_from_u8(v: u8) -> ContentType {
     }
 }
 
+fn should_drop_stale_session_replay(
+    context: &StreamMessageContext,
+    session_established_at_ms: &HashMap<String, u64>,
+) -> bool {
+    if !context.is_replay_sensitive() {
+        return false;
+    }
+    let Some(established_at_ms) = session_established_at_ms.get(&context.contact_id) else {
+        return false;
+    };
+    let Some(cursor_ms) = stream_cursor_millis(context.stream_cursor.as_deref()) else {
+        return false;
+    };
+    cursor_ms < *established_at_ms
+}
+
+fn stream_cursor_millis(cursor: Option<&str>) -> Option<u64> {
+    let cursor = cursor?;
+    let (millis, _) = cursor.split_once('-')?;
+    millis.parse().ok()
+}
+
 fn uuid_v4() -> String {
     use rand::RngCore;
     let mut b = [0u8; 16];
@@ -1321,15 +1452,24 @@ fn uuid_v4() -> String {
 }
 
 fn now_ms() -> i64 {
+    i64::try_from(now_ms_u64()).unwrap_or(i64::MAX)
+}
+
+fn now_ms_u64() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as i64
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use construct_core::crypto::{
+        client_api::ClassicClient, suites::classic::ClassicSuiteProvider,
+    };
 
     #[test]
     fn secure_store_save_action_deletes_empty_payload() {
@@ -1356,5 +1496,217 @@ mod tests {
             Some(b"archive-session".as_ref())
         );
         assert_eq!(storage.secure_load("session_peer").unwrap(), None);
+    }
+
+    #[test]
+    fn stream_cursor_millis_parses_redis_stream_id() {
+        assert_eq!(
+            stream_cursor_millis(Some("1787431771124-0")),
+            Some(1787431771124)
+        );
+        assert_eq!(stream_cursor_millis(Some("1787431771124")), None);
+        assert_eq!(stream_cursor_millis(Some("not-a-cursor")), None);
+        assert_eq!(stream_cursor_millis(None), None);
+    }
+
+    #[test]
+    fn stale_replay_guard_drops_old_msg_zero() {
+        let mut established = HashMap::new();
+        established.insert("bob".to_string(), 2000);
+
+        let context = stream_context("bob", 0, 0, Some("1000-0"));
+
+        assert!(should_drop_stale_session_replay(&context, &established));
+    }
+
+    #[test]
+    fn stale_replay_guard_drops_old_reset_control() {
+        let mut established = HashMap::new();
+        established.insert("bob".to_string(), 2000);
+
+        let context = stream_context("bob", ContentType::SessionReset as u8, 42, Some("1000-0"));
+
+        assert!(should_drop_stale_session_replay(&context, &established));
+    }
+
+    #[test]
+    fn stale_replay_guard_keeps_old_regular_message() {
+        let mut established = HashMap::new();
+        established.insert("bob".to_string(), 2000);
+
+        let context = stream_context("bob", 0, 42, Some("1000-0"));
+
+        assert!(!should_drop_stale_session_replay(&context, &established));
+    }
+
+    #[test]
+    fn stale_replay_guard_keeps_without_local_established_at() {
+        let established = HashMap::new();
+        let context = stream_context("bob", 0, 0, Some("1000-0"));
+
+        assert!(!should_drop_stale_session_replay(&context, &established));
+    }
+
+    #[test]
+    fn stale_replay_guard_keeps_newer_replay_sensitive_message() {
+        let mut established = HashMap::new();
+        established.insert("bob".to_string(), 2000);
+
+        let context = stream_context("bob", 0, 0, Some("3000-0"));
+
+        assert!(!should_drop_stale_session_replay(&context, &established));
+    }
+
+    #[tokio::test]
+    async fn stream_message_command_terminally_drops_stale_msg_zero() {
+        let mut harness = ReplayHarness::new();
+        harness.mark_session_established("bob", 2_000);
+
+        harness
+            .handle_stream_message(stale_message_command("bob", "stale-msg0", 0, 0, false))
+            .await;
+
+        assert_eq!(
+            harness.storage.load_stream_cursor().unwrap().as_deref(),
+            Some("1000-0")
+        );
+        assert_eq!(
+            harness.orchestrator.pending_message_count("bob"),
+            0,
+            "stale msgNum=0 must not enter core pending init queue"
+        );
+        assert!(harness.stream_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn stream_message_command_terminally_drops_stale_reset_with_invalid_wire_payload() {
+        let mut harness = ReplayHarness::new();
+        harness.mark_session_established("bob", 2_000);
+
+        harness
+            .handle_stream_message(stale_message_command(
+                "bob",
+                "stale-reset",
+                ContentType::SessionReset as u8,
+                0,
+                true,
+            ))
+            .await;
+
+        assert_eq!(
+            harness.storage.load_stream_cursor().unwrap().as_deref(),
+            Some("1000-0")
+        );
+        assert_eq!(
+            harness.orchestrator.pending_message_count("bob"),
+            0,
+            "stale reset control must not archive/heal the active actor session"
+        );
+        assert!(harness.stream_rx.try_recv().is_err());
+    }
+
+    fn stream_context(
+        contact_id: &str,
+        content_type: u8,
+        msg_num: u32,
+        stream_cursor: Option<&str>,
+    ) -> StreamMessageContext {
+        StreamMessageContext {
+            contact_id: contact_id.to_string(),
+            message_id: "message-1".to_string(),
+            stream_cursor: stream_cursor.map(str::to_string),
+            content_type,
+            msg_num,
+        }
+    }
+
+    fn stale_message_command(
+        contact_id: &str,
+        message_id: &str,
+        content_type: u8,
+        msg_num: u32,
+        is_control: bool,
+    ) -> OrchestratorCommand {
+        OrchestratorCommand::StreamMessage {
+            event: IncomingEvent::MessageReceived {
+                message_id: message_id.to_string(),
+                from: contact_id.to_string(),
+                data: b"not-a-wire-payload".to_vec(),
+                msg_num,
+                kem_ct: Vec::new(),
+                otpk_id: 0,
+                is_control,
+                content_type,
+            },
+            context: StreamMessageContext {
+                contact_id: contact_id.to_string(),
+                message_id: message_id.to_string(),
+                stream_cursor: Some("1000-0".to_string()),
+                content_type,
+                msg_num,
+            },
+        }
+    }
+
+    struct ReplayHarness {
+        orchestrator: Orchestrator,
+        storage: Storage,
+        stream_tx: tokio::sync::mpsc::Sender<StreamCmd>,
+        stream_rx: tokio::sync::mpsc::Receiver<StreamCmd>,
+        internal_tx: tokio::sync::mpsc::UnboundedSender<crate::app::InternalEventProxy>,
+        grpc: GrpcClient,
+        cursor: CursorTracker,
+        self_tx: tokio::sync::mpsc::UnboundedSender<IncomingEvent>,
+        timers: HashMap<String, AbortHandle>,
+        session_established_at_ms: HashMap<String, u64>,
+    }
+
+    impl ReplayHarness {
+        fn new() -> Self {
+            let client = ClassicClient::<ClassicSuiteProvider>::new()
+                .expect("test ClassicClient should initialize");
+            let orchestrator = Orchestrator::new(client, "alice".to_string());
+            let storage = Storage::open_in_memory().expect("in-memory storage opens");
+            let cursor = CursorTracker::load(&storage);
+            let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(4);
+            let (internal_tx, _internal_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (self_tx, _self_rx) = tokio::sync::mpsc::unbounded_channel();
+
+            Self {
+                orchestrator,
+                storage,
+                stream_tx,
+                stream_rx,
+                internal_tx,
+                grpc: GrpcClient::new("https://127.0.0.1:1"),
+                cursor,
+                self_tx,
+                timers: HashMap::new(),
+                session_established_at_ms: HashMap::new(),
+            }
+        }
+
+        fn mark_session_established(&mut self, contact_id: &str, established_at_ms: u64) {
+            self.session_established_at_ms
+                .insert(contact_id.to_string(), established_at_ms);
+        }
+
+        async fn handle_stream_message(&mut self, command: OrchestratorCommand) {
+            handle_command(
+                command,
+                &mut self.orchestrator,
+                &mut self.storage,
+                &self.stream_tx,
+                &self.internal_tx,
+                &self.grpc,
+                &self.cursor,
+                "alice",
+                "device-a",
+                &self.self_tx,
+                &mut self.timers,
+                &mut self.session_established_at_ms,
+            )
+            .await;
+        }
     }
 }
